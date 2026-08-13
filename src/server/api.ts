@@ -54,6 +54,12 @@
  *   POST /api/runs/:id/cancel   → { run } | 404   (audit run-cancel)
  *   GET  /api/work-items?selector=<json> → { workItems: WorkItem[] } (selector.ts select)
  *   GET  /api/events?runId=&after=&limit= → { events: EventRow[] }
+ *   POST /api/workflows/:id/completions  → 201 { workflowId, unitId?, targetId?, completed }
+ *                                  (body: { targetId?, unitId?, reason? }; auth + audit,
+ *                                   delegating to the WorkflowCompletionStore — SPEC §5.4)
+ *   DELETE /api/workflows/:id/completions → 200 { workflowId, unitId?, targetId?, removed }
+ *                                  (body: { targetId?, unitId? }; auth + audit;
+ *                                   neither given = clear ALL rows for the workflow)
  *   POST /api/analyze              → 200 { result }  (body: { prompt, runId?, model? };
  *                                  introspection agent, prompt bounded, audited)
  *   WS   /ws/events[?after=]    → JSON-line event stream (see above)
@@ -83,6 +89,7 @@ import {
   runAnalysis,
 } from "./analyze.js";
 import type { RunRecord, RunScheduler, RunSpec } from "./scheduler.js";
+import { WorkflowCompletionStore } from "../workflow/completions.js";
 
 export type { RunRecord, RunSpec } from "./scheduler.js";
 
@@ -234,6 +241,8 @@ export interface CreateRunInput {
   selector?: Selector;
   /** Whole-run cap in integer micro-USD; undefined = unlimited. */
   budgetMicroUsd?: number;
+  /** Explicit run scope (SPEC §6): target/unit id allowlists, AND-ed together. */
+  scope?: { targetIds?: string[]; unitIds?: string[] };
 }
 
 /** Options for {@link createApiServer}. */
@@ -258,7 +267,12 @@ export interface ApiServerOptions {
   /** Max request body bytes; defaults to 1 MiB. */
   maxBodyBytes?: number;
   /**
-   * Agent runtime for `POST /api/analyze` (SPEC §17). Defaults to a
+   * Workflow completion store for `POST`/`DELETE
+   * /api/workflows/:id/completions` (SPEC §5.4). Defaults to one over
+   * `store` — serve/tests only inject a custom instance to double the writer.
+   */
+  completions?: WorkflowCompletionStore;
+  /** Agent runtime for `POST /api/analyze` (SPEC §17). Defaults to a
    * deterministic `MockAgentRuntime` with {@link DEFAULT_ANALYZE_MODEL}
    * registered.
    */
@@ -379,6 +393,23 @@ function parseCreateRunInput(body: unknown): CreateRunInput {
       throw new ApiError(400, "'budgetMicroUsd' must be a non-negative integer");
     }
     input.budgetMicroUsd = budget;
+  }
+  if (body.scope !== undefined) {
+    if (!isPlainObject(body.scope)) {
+      throw new ApiError(400, "'scope' must be a JSON object");
+    }
+    const scope = body.scope;
+    const parsedScope: { targetIds?: string[]; unitIds?: string[] } = {};
+    for (const key of ["targetIds", "unitIds"] as const) {
+      const value = scope[key];
+      if (value !== undefined) {
+        if (!Array.isArray(value) || value.some((x) => typeof x !== "string")) {
+          throw new ApiError(400, `'scope.${key}' must be an array of strings`);
+        }
+        parsedScope[key] = value;
+      }
+    }
+    input.scope = parsedScope;
   }
   return input;
 }
@@ -758,6 +789,12 @@ class ControlPlane {
   private get authTokens(): AuthTokenProvider {
     return this.opts.authTokens;
   }
+  /** Workflow completion store (SPEC §5.4); defaults to one over the store. */
+  private completionStore: WorkflowCompletionStore | null = null;
+  private get completions(): WorkflowCompletionStore {
+    this.completionStore ??= this.opts.completions ?? new WorkflowCompletionStore(this.store);
+    return this.completionStore;
+  }
   private get pollIntervalMs(): number {
     return this.opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   }
@@ -853,6 +890,18 @@ class ControlPlane {
     if (method === "POST" && path === "/api/analyze") {
       await this.handleAnalyze(req, res, identity);
       return;
+    }
+    const workflowMatch = /^\/api\/workflows\/([^/]+)\/completions$/.exec(path);
+    if (workflowMatch !== null) {
+      if (method === "POST") {
+        await this.handleCompleteWorkflow(req, res, identity, workflowMatch[1]!);
+        return;
+      }
+      if (method === "DELETE") {
+        await this.handleUncompleteWorkflow(req, res, identity, workflowMatch[1]!);
+        return;
+      }
+      throw new ApiError(404, "not found");
     }
     const runMatch = /^\/api\/runs\/([^/]+)$/.exec(path);
     if (runMatch !== null) {
@@ -961,6 +1010,7 @@ class ControlPlane {
       model: input.model,
       actor: identity.id,
       ...(input.selector !== undefined ? { selector: input.selector } : {}),
+      ...(input.scope !== undefined ? { scope: input.scope } : {}),
       ...(input.budgetMicroUsd !== undefined
         ? { budgetMicroUsd: input.budgetMicroUsd }
         : {}),
@@ -1063,6 +1113,106 @@ class ControlPlane {
       data: { promptLength: prompt.length },
     });
     sendJson(res, 200, { result });
+  }
+
+  /**
+   * Parse the shared `{ targetId?, unitId? }` body shape of the completions
+   * endpoints (SPEC §5.4). `requireOne` enforces the complete contract (at
+   * least one id); uncomplete allows neither (clear-all, store semantics).
+   */
+  private parseCompletionScope(
+    body: unknown,
+    requireOne: boolean,
+  ): { targetId?: string; unitId?: string } {
+    if (!isPlainObject(body)) throw new ApiError(400, "body must be a JSON object");
+    const targetId = body.targetId;
+    const unitId = body.unitId;
+    if (targetId !== undefined && (typeof targetId !== "string" || targetId.length === 0)) {
+      throw new ApiError(400, "'targetId' must be a non-empty string");
+    }
+    if (unitId !== undefined && (typeof unitId !== "string" || unitId.length === 0)) {
+      throw new ApiError(400, "'unitId' must be a non-empty string");
+    }
+    if (requireOne && targetId === undefined && unitId === undefined) {
+      throw new ApiError(400, "at least one of 'targetId' or 'unitId' is required");
+    }
+    return {
+      ...(targetId !== undefined ? { targetId } : {}),
+      ...(unitId !== undefined ? { unitId } : {}),
+    };
+  }
+
+  private async readJsonBody(req: IncomingMessage): Promise<unknown> {
+    const body = await readBody(req, this.maxBodyBytes);
+    try {
+      return JSON.parse(body.length === 0 ? "null" : body.toString("utf8"));
+    } catch (err) {
+      throw new ApiError(
+        400,
+        `invalid JSON body: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * POST /api/workflows/:id/completions (SPEC §5.4): insert-or-ignore a
+   * completion row through the store (auth + audit). `{ promote:false }`-style
+   * manual completion: the row alone marks the scope complete; no work_items
+   * write (the daemon's `finalizeWorkflowItem` is the run-time writer).
+   */
+  private async handleCompleteWorkflow(
+    req: IncomingMessage,
+    res: ServerResponse,
+    identity: TokenIdentity,
+    workflowId: string,
+  ): Promise<void> {
+    const parsed = await this.readJsonBody(req);
+    const { targetId, unitId } = this.parseCompletionScope(parsed, true);
+    const reason = (parsed as Record<string, unknown>).reason;
+    if (reason !== undefined && typeof reason !== "string") {
+      throw new ApiError(400, "'reason' must be a string");
+    }
+    const inserted = await this.completions.complete({
+      workflowId,
+      actor: identity.id,
+      ...(targetId !== undefined ? { targetId } : {}),
+      ...(unitId !== undefined ? { unitId } : {}),
+      ...(reason !== undefined ? { reason } : {}),
+    });
+    await this.writeAudit({
+      actor: identity.id,
+      action: "workflow-complete",
+      costMicroUsd: null,
+      data: { workflowId, unitId, targetId, reason },
+    });
+    sendJson(res, 201, { workflowId, unitId, targetId, completed: inserted });
+  }
+
+  /**
+   * DELETE /api/workflows/:id/completions (SPEC §5.4): remove matching rows
+   * (target-scoped deletes the precise run-time row too). Neither id given =
+   * clear ALL completion rows for the workflow. Auth + audit.
+   */
+  private async handleUncompleteWorkflow(
+    req: IncomingMessage,
+    res: ServerResponse,
+    identity: TokenIdentity,
+    workflowId: string,
+  ): Promise<void> {
+    const parsed = await this.readJsonBody(req);
+    const { targetId, unitId } = this.parseCompletionScope(parsed, false);
+    const removed = await this.completions.uncomplete({
+      workflowId,
+      ...(targetId !== undefined ? { targetId } : {}),
+      ...(unitId !== undefined ? { unitId } : {}),
+    });
+    await this.writeAudit({
+      actor: identity.id,
+      action: "workflow-uncomplete",
+      costMicroUsd: null,
+      data: { workflowId, unitId, targetId },
+    });
+    sendJson(res, 200, { workflowId, unitId, targetId, removed });
   }
 
   private async handleWorkItems(req: IncomingMessage, res: ServerResponse): Promise<void> {

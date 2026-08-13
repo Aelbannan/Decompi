@@ -28,6 +28,7 @@ import { matchContextFromFixture } from "../parse/cpp/rules/match.js";
 import type { Finding } from "../parse/cpp/types.js";
 import { loadModels } from "../models/directory.js";
 import { startServer } from "../server/serve.js";
+import type { RunSpec } from "../server/scheduler.js";
 import { MockAgentRuntime } from "../agent/mock.js";
 import {
   AnalyzeTools,
@@ -35,6 +36,8 @@ import {
   DEFAULT_ANALYZE_MODEL_SPEC,
   runAnalysis,
 } from "../server/analyze.js";
+import { WorkflowCompletionStore } from "../workflow/completions.js";
+import { Decompi } from "../workflow/facade.js";
 
 /** Minimal sink for CLI output (process.stdout in the bin, buffers in tests). */
 export interface Output {
@@ -95,6 +98,23 @@ commands:
       the final text. --run scopes the question to one run id (injected into
       the prompt). The session runs on the deterministic mock runtime (the
       real pi SDK agent lands in M5).
+  workflow complete <wf> --target <id> | --unit <id> [--reason …] [--db <path>]
+      Mark one target (or every target of one unit) complete for workflow
+      <wf> (SPEC §5.4): an insert-or-ignore row in workflow_completions,
+      actor "manual". Idempotent — completing twice is not an error.
+  workflow uncomplete <wf> --target <id> | --unit <id> [--db <path>]
+      Remove the completion row(s) for the target/unit (SPEC §5.4); the item
+      becomes re-selectable by the workflow's plan. Prints how many rows were
+      removed.
+  workflow status <wf> [--unit <id>] [--db <path>]
+      List the workflow's completion rows (unit | target | actor | reason |
+      completed_at), or only those of --unit <id>.
+  run <wf> [--model <name>] [--budget <micro-usd>] [--target <id>]... [--unit <id>]...
+      Create a run of workflow <wf> (SPEC §6/§7): builds a RunSpec with the
+      repeatable --target / --unit scope (AND-ed) and delegates to the
+      Decompi facade's scheduler. Fails with a clear error when the facade is
+      not configured (e.g. inside an embedding harness that calls
+      Decompi.configure first).
   serve [--port <port>] [--db <path>] [--detached]
       M4 control plane (SPEC §15/§16): embedded store daemon + match
       pipelines + run scheduler + bearer-auth REST/WS API + the web/
@@ -742,6 +762,253 @@ export function runReportCheck(
   return result.ok;
 }
 
+// ─── workflow completions (SPEC §5.4) + run (SPEC §6/§7) ──────────────────
+
+/**
+ * Collect every value of a repeatable value flag (`--name v1 --name v2` and
+ * `--name=v` both work). `parseArgs` keeps only the LAST value per flag name,
+ * so repeatable flags (SPEC §6: `--target` / `--unit`) are collected here
+ * from the raw argv instead. Stops at the `--` positional separator.
+ */
+export function collectRepeatedValues(args: readonly string[], name: string): string[] {
+  const flag = `--${name}`;
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--") break;
+    if (arg.startsWith(`${flag}=`)) {
+      out.push(arg.slice(flag.length + 1));
+    } else if (arg === flag) {
+      const next = args[i + 1];
+      if (next === undefined || next.startsWith("-")) {
+        throw new Error(`--${name} requires a value`);
+      }
+      out.push(next);
+      i++;
+    }
+  }
+  return out;
+}
+
+/** Open the store (like cmdStatus) and wrap a completion store over it. */
+async function openCompletions(
+  parsed: ParsedArgs,
+): Promise<{ adapter: SqliteAdapter; store: WorkflowCompletionStore }> {
+  const { dbPath, fixturePath } = dbAndFixture(parsed);
+  const adapter = await openAndImport(dbPath, fixturePath);
+  return { adapter, store: new WorkflowCompletionStore(adapter) };
+}
+
+/** Require exactly one of `--target <id>` / `--unit <id>`; return the scope. */
+function targetOrUnit(
+  parsed: ParsedArgs,
+  verb: string,
+): { targetId?: string; unitId?: string } {
+  const targetId = parsed.values.get("target");
+  const unitId = parsed.values.get("unit");
+  if ((targetId === undefined) === (unitId === undefined)) {
+    throw new Error(
+      `workflow ${verb} requires exactly one of --target <id> or --unit <id>`,
+    );
+  }
+  return targetId !== undefined ? { targetId } : { unitId: unitId! };
+}
+
+/** `workflow complete <wf> --target <id> | --unit <id> [--reason …]`. */
+export async function runWorkflowComplete(
+  store: WorkflowCompletionStore,
+  workflowId: string,
+  opts: { targetId?: string; unitId?: string; reason?: string } = {},
+  out: Output = process.stdout,
+): Promise<void> {
+  const inserted = await store.complete({
+    workflowId,
+    ...(opts.targetId !== undefined ? { targetId: opts.targetId } : {}),
+    ...(opts.unitId !== undefined ? { unitId: opts.unitId } : {}),
+    actor: "manual",
+    ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
+  });
+  const what = opts.targetId ?? opts.unitId;
+  out.write(
+    `${inserted ? "completed" : "already complete"}: ${what} for workflow ${workflowId}\n`,
+  );
+}
+
+/** `workflow uncomplete <wf> --target <id> | --unit <id>`. */
+export async function runWorkflowUncomplete(
+  store: WorkflowCompletionStore,
+  workflowId: string,
+  opts: { targetId?: string; unitId?: string } = {},
+  out: Output = process.stdout,
+): Promise<void> {
+  const removed = await store.uncomplete({
+    workflowId,
+    ...(opts.targetId !== undefined ? { targetId: opts.targetId } : {}),
+    ...(opts.unitId !== undefined ? { unitId: opts.unitId } : {}),
+  });
+  out.write(`uncompleted ${removed} row(s) for workflow ${workflowId}\n`);
+}
+
+/** `workflow status <wf> [--unit <id>]` — one line per completion row. */
+export async function runWorkflowStatus(
+  store: WorkflowCompletionStore,
+  workflowId: string,
+  opts: { unit?: string } = {},
+  out: Output = process.stdout,
+): Promise<void> {
+  const rows = await store.list(workflowId);
+  const filtered = opts.unit === undefined ? rows : rows.filter((r) => r.unitId === opts.unit);
+  if (filtered.length === 0) {
+    out.write(
+      `no completions for workflow ${workflowId}${opts.unit !== undefined ? ` (unit ${opts.unit})` : ""}\n`,
+    );
+    return;
+  }
+  out.write(`workflow ${workflowId} — ${filtered.length} completion(s)\n`);
+  for (const row of filtered) {
+    out.write(
+      `${row.completedAt}\t${row.unitId || "-"}\t${row.targetId || "-"}\t${row.actor}\t${row.reason ?? ""}\n`,
+    );
+  }
+}
+
+async function cmdWorkflowComplete(args: readonly string[]): Promise<void> {
+  const parsed = parseArgs(args);
+  checkFlags(parsed, new Set(["target", "unit", "reason", "db", "fixture"]));
+  requireValueFlag(parsed, "target");
+  requireValueFlag(parsed, "unit");
+  requireValueFlag(parsed, "reason");
+  requireValueFlag(parsed, "db");
+  requireValueFlag(parsed, "fixture");
+  if (parsed.positionals.length !== 1) {
+    throw new Error("workflow complete requires exactly one argument: <workflow-id>");
+  }
+  const { targetId, unitId } = targetOrUnit(parsed, "complete");
+  const { adapter, store } = await openCompletions(parsed);
+  try {
+    await runWorkflowComplete(store, parsed.positionals[0]!, {
+      ...(targetId !== undefined ? { targetId } : {}),
+      ...(unitId !== undefined ? { unitId } : {}),
+      ...(parsed.values.get("reason") !== undefined
+        ? { reason: parsed.values.get("reason") }
+        : {}),
+    });
+  } finally {
+    adapter.close();
+  }
+}
+
+async function cmdWorkflowUncomplete(args: readonly string[]): Promise<void> {
+  const parsed = parseArgs(args);
+  checkFlags(parsed, new Set(["target", "unit", "db", "fixture"]));
+  requireValueFlag(parsed, "target");
+  requireValueFlag(parsed, "unit");
+  requireValueFlag(parsed, "db");
+  requireValueFlag(parsed, "fixture");
+  if (parsed.positionals.length !== 1) {
+    throw new Error("workflow uncomplete requires exactly one argument: <workflow-id>");
+  }
+  const { targetId, unitId } = targetOrUnit(parsed, "uncomplete");
+  const { adapter, store } = await openCompletions(parsed);
+  try {
+    await runWorkflowUncomplete(store, parsed.positionals[0]!, {
+      ...(targetId !== undefined ? { targetId } : {}),
+      ...(unitId !== undefined ? { unitId } : {}),
+    });
+  } finally {
+    adapter.close();
+  }
+}
+
+async function cmdWorkflowStatus(args: readonly string[]): Promise<void> {
+  const parsed = parseArgs(args);
+  checkFlags(parsed, new Set(["unit", "db", "fixture"]));
+  requireValueFlag(parsed, "unit");
+  requireValueFlag(parsed, "db");
+  requireValueFlag(parsed, "fixture");
+  if (parsed.positionals.length !== 1) {
+    throw new Error("workflow status requires exactly one argument: <workflow-id>");
+  }
+  const { adapter, store } = await openCompletions(parsed);
+  try {
+    await runWorkflowStatus(store, parsed.positionals[0]!, {
+      ...(parsed.values.get("unit") !== undefined
+        ? { unit: parsed.values.get("unit") }
+        : {}),
+    });
+  } finally {
+    adapter.close();
+  }
+}
+
+async function cmdWorkflow(args: readonly string[]): Promise<void> {
+  const sub = args[0];
+  switch (sub) {
+    case "complete":
+      return cmdWorkflowComplete(args.slice(1));
+    case "uncomplete":
+      return cmdWorkflowUncomplete(args.slice(1));
+    case "status":
+      return cmdWorkflowStatus(args.slice(1));
+    default:
+      throw new Error(
+        `unknown workflow subcommand: ${sub ?? "(none)"} (expected complete | uncomplete | status)`,
+      );
+  }
+}
+
+/**
+ * `run <wf> [--model name] [--budget $] [--target id]... [--unit id]...`
+ * (SPEC §6/§7): build the `RunSpec` (scope AND-ed from the repeatable
+ * target/unit flags) and delegate to the configured `Decompi` facade. The
+ * CLI never configures the facade itself — an embedding harness does — so
+ * an unconfigured facade surfaces a clear "no scheduler configured" error.
+ */
+async function cmdRun(args: readonly string[]): Promise<void> {
+  const parsed = parseArgs(args);
+  checkFlags(parsed, new Set(["model", "budget", "target", "unit"]));
+  requireValueFlag(parsed, "model");
+  requireValueFlag(parsed, "budget");
+  if (parsed.positionals.length !== 1) {
+    throw new Error("run requires exactly one argument: <workflow-id>");
+  }
+  const workflowId = parsed.positionals[0]!;
+  const model = parsed.values.get("model");
+  if (model === undefined) throw new Error("run requires --model <name>");
+  const budgetRaw = parsed.values.get("budget");
+  let budgetMicroUsd: number | undefined;
+  if (budgetRaw !== undefined) {
+    if (!/^\d+$/.test(budgetRaw)) {
+      throw new Error(`invalid --budget: ${budgetRaw} (expected a non-negative integer)`);
+    }
+    budgetMicroUsd = Number(budgetRaw);
+  }
+  // SPEC §6: repeatable --target / --unit, AND-ed into the run scope.
+  const scope = {
+    targetIds: collectRepeatedValues(args, "target"),
+    unitIds: collectRepeatedValues(args, "unit"),
+  };
+  const spec: RunSpec = {
+    pipeline: workflowId,
+    model,
+    ...(budgetMicroUsd !== undefined ? { budgetMicroUsd } : {}),
+    scope,
+  };
+  try {
+    const runId = await Decompi.run(spec);
+    process.stdout.write(`run ${runId} created (pipeline ${workflowId}, model ${model})\n`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/before run\(\)/.test(message)) {
+      throw new Error(
+        "no scheduler configured: Decompi.configure({ engine, scheduler }) must be " +
+          "called before `decompi run` (e.g. by an embedding harness or serve)",
+      );
+    }
+    throw err;
+  }
+}
+
 // ─── wiring ──────────────────────────────────────────────────────────────────
 
 async function openAndImport(
@@ -992,6 +1259,10 @@ export async function main(argv: readonly string[]): Promise<void> {
       return cmdImport(argv.slice(1));
     case "analyze":
       return cmdAnalyze(argv.slice(1));
+    case "workflow":
+      return cmdWorkflow(argv.slice(1));
+    case "run":
+      return cmdRun(argv.slice(1));
     case "models":
       return cmdModels(argv.slice(1));
     case "serve":

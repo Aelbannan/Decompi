@@ -10,11 +10,17 @@
  *  - `foreach` groups its items (by `key` when set) into batches of `batch`
  *    and runs its child `steps` once PER batch (one shared agent session);
  *  - `select` stores a named binding consumed by a later `foreach.from`;
+ *  - `agentLoop` holds one agent session across re-prompt turns: accepted
+ *    items are finalized and leave play; rejected items stay in play until
+ *    the loop exits (empty play, `final`, or `rejectionRetries` cap) and then
+ *    surface as rejected (routed by `onReject` inside a foreach);
  *  - `onReject` routes rejected items to steps-only fragments (see `Route`).
  */
 import type { Selector, Verifier, WorkItem } from "../types.js";
 import type { AgentRuntime, SessionUsage } from "../agent/runtime.js";
 import type { PromptSpec } from "../prompt/builder.js";
+// Type-only: erased at compile time, so the cycle engine.ts <-> types.ts is safe.
+import type { AgentTurn } from "./engine.js";
 
 /** The most recent agent turn in a scope (set by `agent` steps; shared across foreach forks). */
 export interface LastAgentResult {
@@ -35,6 +41,12 @@ export interface StepCtx {
   bindings: Map<string, WorkItem[]>;
   run(step: Step, items: WorkItem[]): Promise<StepOutcome>;
   log(level: string, msg: string): void;
+  /**
+   * Completion writer for `agentLoop` accepted items (SPEC §4): called with
+   * `{ promote: true }` per accepted item. Optional — defaults to a no-op
+   * when the run supplies no writer.
+   */
+  finalize?: (item: WorkItem, action: unknown) => Promise<void>;
   /** Most recent agent turn in this scope (agent steps; transforms may read it). */
   lastAgentResult?: LastAgentResult;
 }
@@ -47,7 +59,24 @@ export type Step =
   | { kind: "transform"; fn: (ctx: StepCtx) => Promise<void> }
   | { kind: "select"; selector: Selector; into: string }
   | { kind: "foreach"; from?: string; batch: number; key?: string; steps: Step[]; onReject?: Route[] }
-  | { kind: "gate"; when: (ctx: StepCtx) => boolean | Promise<boolean> };
+  | { kind: "gate"; when: (ctx: StepCtx) => boolean | Promise<boolean> }
+  | {
+      kind: "agentLoop";
+      start: (targets: WorkItem[], ctx: StepCtx) => Promise<string>;
+      reprompt: (
+        targets: WorkItem[],
+        ctx: StepCtx,
+        lastTurn: AgentTurn,
+      ) => Promise<{
+        accepted: WorkItem[];
+        rejected: WorkItem[];
+        feedback?: string;
+        final?: boolean;
+      }>;
+      rejectionRetries?: number;
+      model?: string;
+      tools?: string[];
+    };
 
 /**
  * Ordered retry predicate (SPEC §10). Evaluated in order for each rejected

@@ -9,6 +9,11 @@
  *    items from a `select`-produced binding (default: current scope items);
  *  - `verify` looks up `verifiers.get(name)` and splits items into
  *    accepted (finalized) / rejected (still in play: the next step sees them);
+ *  - `agentLoop` holds ONE agent session across re-prompt turns: accepted
+ *    items are finalized (via `ctx.finalize`) and leave play; rejected and
+ *    absent items stay in play until the loop exits (empty play, `final`, or
+ *    the `rejectionRetries` cap) and then surface as rejected (routed by
+ *    `onReject` inside a foreach);
  *  - `gate` false aborts the CURRENT scope: remaining steps are skipped and
  *    the scope's items surface in the run outcome as `skipped` (they are
  *    never routed through `onReject` — a gate is a skip, not a failure);
@@ -53,6 +58,12 @@ export interface RunContext {
   log?: (level: string, msg: string) => void;
   /** Adapter style guide (Markdown file); injected + hashed into every agent prompt (SPEC §12). */
   styleGuidePath?: string;
+  /**
+   * Completion writer for `agentLoop` accepted items (SPEC §4): called with
+   * `{ promote: true }` per accepted item. Defaults to a no-op; the
+   * workflow/daemon integration supplies the transactional writer.
+   */
+  finalize?: (item: WorkItem, action: unknown) => Promise<void>;
 }
 
 /** Terminal outcome of a run. `accepted`/`rejected`/`skipped` are disjoint. */
@@ -88,6 +99,8 @@ interface RunState {
   styleGuidePath?: string;
   /** Most recent agent turn in the run, shared across scopes (foreach/fragments). */
   lastAgentResult?: AgentTurn;
+  /** Completion writer for `agentLoop` accepted items (default: no-op). */
+  finalize: (item: WorkItem, action: unknown) => Promise<void>;
 }
 
 /** Engine-internal context: `StepCtx` + the scope's model + run state. */
@@ -131,6 +144,9 @@ function normalizeVerifiers(input: RunContext["verifiers"]): Map<string, Verifie
 }
 
 const NOOP_LOG = (_level: string, _msg: string): void => {};
+
+/** Default `finalize`: a run without a completion writer accepts nothing. */
+const NOOP_FINALIZE = async (_item: WorkItem, _action: unknown): Promise<void> => {};
 
 /** Append every `foreach.onReject[].to` reachable in `steps` (nested foreach included). */
 function collectRouteTargets(steps: readonly Step[], out: string[]): void {
@@ -221,6 +237,7 @@ export class PipelineEngine {
       defaultModel: ctx0.defaultModel,
       attempts: new Map(),
       ...(ctx0.styleGuidePath !== undefined ? { styleGuidePath: ctx0.styleGuidePath } : {}),
+      finalize: ctx0.finalize ?? NOOP_FINALIZE,
     };
     state.log("info", `run ${id}: start (model=${ctx0.defaultModel})`);
     const ctx = this.makeCtx(state, ctx0.defaultModel);
@@ -332,6 +349,7 @@ export class PipelineEngine {
         return { accepted: exec.accepted, rejected: [...exec.rejected, ...exec.skipped] };
       },
       log: state.log,
+      finalize: state.finalize,
       model,
       state,
       lastAgentResult: state.lastAgentResult,
@@ -378,6 +396,8 @@ export class PipelineEngine {
     switch (step.kind) {
       case "agent":
         return this.runAgentStep(step, ctx);
+      case "agentLoop":
+        return this.runAgentLoopStep(step, ctx);
       case "shell":
         return this.runShellStep(step, ctx);
       case "verify":
@@ -417,6 +437,81 @@ export class PipelineEngine {
     ctx.log("info", `agent: ${items.length} item(s) on ${model}`);
     // An agent turn is not a verifier: every item stays in play.
     return { accepted: [], rejected: items, skipped: [], aborted: false };
+  }
+
+  /**
+   * `agentLoop` (SPEC §4): hold ONE agent session across re-prompt turns over
+   * the scope's items (a `foreach` body's batch, or the scope at top level).
+   * Each turn renders the next prompt (start text, then `verdict.feedback`)
+   * and prompts the session through the engine's wrapped runtime — the same
+   * `createSession`/`prompt` path as `agent` steps — so per-turn pacing,
+   * budget checks, and pause apply without re-implementation. `reprompt`
+   * decides the verdict: ONLY `accepted` items leave play (each finalized via
+   * `ctx.finalize?.(item, { promote: true })`, a no-op when the run supplies
+   * no writer); `rejected` and absent items STAY in play. The loop exits when
+   * nothing is in play, on `verdict.final`, or once `turns >= rejectionRetries`
+   * (default 1); the still-in-play items surface as rejected so `onReject`
+   * routes them.
+   */
+  private async runAgentLoopStep(
+    step: Extract<Step, { kind: "agentLoop" }>,
+    ctx: RunCtx,
+  ): Promise<StepExec> {
+    const items = ctx.items;
+    if (items.length === 0) {
+      return { accepted: [], rejected: [], skipped: [], aborted: false };
+    }
+    const model = step.model ?? ctx.model;
+    const rejectionRetries = step.rejectionRetries ?? 1;
+    const finalize = ctx.finalize ?? NOOP_FINALIZE;
+    // ONE session is held across every turn (SPEC §4). The run-time wrapper
+    // (budget/pacing) applies at session creation AND on each prompt() turn.
+    let prompt = await step.start(items, ctx);
+    const session = await ctx.runtime.createSession({
+      model,
+      prompt,
+      ...(step.tools !== undefined ? { tools: step.tools } : {}),
+    });
+
+    const accepted: WorkItem[] = [];
+    let inPlay: WorkItem[] = [...items];
+    let turns = 0;
+
+    while (inPlay.length > 0) {
+      turns += 1;
+      const result = await session.prompt(prompt);
+      const turn: AgentTurn = {
+        model,
+        text: result.finalText,
+        usage: result.usage,
+        // agentLoop prompts are the hook's verbatim text (no PromptBuilder
+        // style-guide injection — that belongs to the workflow compiler).
+        styleGuideHash: "",
+      };
+      // Written to both the local ctx and the shared run state so forked
+      // scopes and later transforms see the loop's final turn.
+      ctx.lastAgentResult = turn;
+      ctx.state.lastAgentResult = turn;
+      const verdict = await step.reprompt(inPlay, ctx, turn);
+
+      // Only accepted items leave play; rejected + absent items stay in play
+      // and are described by `feedback` for the next turn.
+      const acceptedIds = new Set(verdict.accepted.map((i) => i.id));
+      for (const item of verdict.accepted) {
+        accepted.push(item);
+        await finalize(item, { promote: true });
+      }
+      inPlay = inPlay.filter((i) => !acceptedIds.has(i.id));
+      ctx.log(
+        "info",
+        `agentLoop: turn ${turns} accepted ${verdict.accepted.length}, in play ${inPlay.length} (model=${model})`,
+      );
+      if (inPlay.length === 0) break;
+      if (verdict.final === true || turns >= rejectionRetries) break;
+      prompt = verdict.feedback ?? prompt;
+    }
+
+    return { accepted, rejected: inPlay, skipped: [], aborted: false };
   }
 
   private async runShellStep(

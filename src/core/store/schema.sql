@@ -213,3 +213,21 @@ CREATE TABLE audit_log (              -- who started/stopped what, spend per tok
   cost_micro_usd INTEGER,
   data TEXT NOT NULL DEFAULT '{}'
 );
+
+-- Per-workflow manual/run completion (SPEC §5.1). Row forms:
+--   (wf, U, '')  unit-scoped    -- every target of unit U is complete
+--   (wf, '', T)  target-scoped  -- target T is complete
+--   (wf, U, T)   precise        -- target T of unit U (run-time finalize)
+CREATE TABLE workflow_completions (
+  id TEXT PRIMARY KEY,
+  workflow_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL DEFAULT '',
+  target_id TEXT NOT NULL DEFAULT '',
+  completed_at TEXT NOT NULL,
+  actor TEXT NOT NULL,                 -- token id, "manual", or run_id
+  reason TEXT,
+  UNIQUE (workflow_id, unit_id, target_id)
+);
+CREATE INDEX idx_workflow_completions_workflow ON workflow_completions(workflow_id);
+CREATE INDEX idx_workflow_completions_unit ON workflow_completions(unit_id);
+CREATE INDEX idx_workflow_completions_target ON workflow_completions(target_id);

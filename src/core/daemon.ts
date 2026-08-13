@@ -4,7 +4,8 @@
  * lands in M4).
  *
  * Single-writer facade: every mutating call — `claim`, `heartbeat`,
- * `release`, `reapExpired`, `emit`, `importWorkItems` — serializes through
+ * `release`, `reapExpired`, `emit`, `importWorkItems`,
+ * `finalizeWorkflowItem` — serializes through
  * one promise-chain `writeQueue`, so enqueue order is commit order and
  * `events.seq` assignment (via the EventStore's counters transaction, which
  * is already single-writer-safe) is deterministic and gap-free even under
@@ -32,7 +33,14 @@ import { randomUUID } from "node:crypto";
 import type { SqlAdapter } from "./store/adapter.js";
 import type { Selector, WorkItem } from "../types.js";
 import { ClaimStore, type ClaimRequest } from "../target/claim.js";
-import { EventStore, type EmitEvent, type EventRow } from "./events.js";
+import {
+  EventStore,
+  EVENTS_SEQ_COUNTER,
+  type EmitEvent,
+  type EventRow,
+} from "./events.js";
+import { WorkflowCompletionStore } from "../workflow/completions.js";
+import type { CompletionAction } from "../workflow/types.js";
 import {
   exportRegistry,
   importRegistry,
@@ -45,6 +53,19 @@ export type ClaimArgs = Omit<ClaimRequest, "epoch">;
 
 /** Event input for the daemon (see {@link EventStore.emit}). */
 export type EmitArgs = EmitEvent;
+
+/**
+ * Finalize input for the daemon (SPEC §5.3): the workflow, the target, the
+ * actor, and the decider's `CompletionAction` (what "complete" means for
+ * this target). The daemon is the ONLY writer for this transition — hooks
+ * never reach `execute`/`transaction` directly.
+ */
+export interface FinalizeWorkflowItemInput {
+  workflowId: string;
+  target: WorkItem;
+  actor: string;
+  action: CompletionAction;
+}
 
 export interface StoreDaemonOptions {
   /** Daemon-start UUID (SPEC §6.3); defaults to a fresh `randomUUID()`. */
@@ -153,6 +174,105 @@ export class StoreDaemon {
   emit(e: EmitArgs): Promise<number> {
     if (this.closed) return this.closedError();
     return this.enqueue(() => this.events.emit(e));
+  }
+
+  /**
+   * Finalize one workflow item (SPEC §5.3): the single writer for run-time
+   * workflow completion. ONE transaction writes, in order:
+   *
+   *   1. the precise completion row `(wf, unit-of-target, target)` —
+   *      insert-or-ignore, so a racing manual complete (or a re-finalize of
+   *      a stable accepted item) never double-writes;
+   *   2. the `CompletionAction` write on `work_items`: `promote:true` sets
+   *      `lifecycle='accepted'` and `status` (COALESCE keeps the current
+   *      status when none is given); `{status}` alone sets only status;
+   *      `promote:false` with no status skips the work_items write entirely;
+   *   3. a `target-accepted` event row, appended in the SAME transaction via
+   *      the events counter (the same seq source `EventStore.emit` uses, so
+   *      seqs stay gap-free even alongside micro-batched emits). The row,
+   *      the item write, and the event commit or roll back together.
+   *
+   * Idempotent: when the completion row already exists (the insert is
+   * ignored — detected via the insert's `changes`), the lifecycle/status
+   * write still runs when the action asks for it, but NO duplicate event is
+   * emitted.
+   */
+  finalizeWorkflowItem(input: FinalizeWorkflowItemInput): Promise<void> {
+    if (this.closed) return this.closedError();
+    return this.enqueue(() =>
+      this.adapter.transaction(async (tx) => {
+        const ts = new Date().toISOString();
+        const { workflowId, target, actor, action } = input;
+        const unitId = target.unitId ?? "";
+
+        // 1. Completion row, precise form (SPEC §5.1). `inserted` is false
+        //    when the exact (wf, unit, target) row already exists.
+        const completions = new WorkflowCompletionStore(tx);
+        const inserted = await completions.complete({
+          workflowId,
+          unitId,
+          targetId: target.id,
+          actor,
+          reason: "run-time",
+        });
+
+        // 2. The CompletionAction write (SPEC §5.3).
+        const promote = "promote" in action && action.promote === true;
+        const status = "status" in action ? action.status : undefined;
+        if (promote) {
+          await tx.execute(
+            "UPDATE work_items SET lifecycle = 'accepted', status = COALESCE(?, status), updated_at = ? WHERE id = ?",
+            [status ?? null, ts, target.id],
+          );
+        } else if (status !== undefined) {
+          await tx.execute(
+            "UPDATE work_items SET status = ?, updated_at = ? WHERE id = ?",
+            [status, ts, target.id],
+          );
+        }
+        // { promote: false } without a status: no work_items write at all.
+
+        // 3. `target-accepted` event, same transaction, only when THIS call
+        //    recorded the completion (a re-finalize never duplicates it).
+        if (inserted && promote) {
+          // Seq from the events counter — the same source EventStore.emit
+          // drains, so seqs stay gap-free across both write paths.
+          await tx.insertIgnore(
+            "INSERT INTO counters (name, next) VALUES (?, ?)",
+            [EVENTS_SEQ_COUNTER, 0],
+          );
+          await tx.execute("UPDATE counters SET next = next + 1 WHERE name = ?", [
+            EVENTS_SEQ_COUNTER,
+          ]);
+          const rows = await tx.query<{ next: number | bigint }>(
+            "SELECT next FROM counters WHERE name = ?",
+            [EVENTS_SEQ_COUNTER],
+          );
+          const next = rows[0]?.next;
+          if (next === undefined) {
+            throw new Error(
+              `event store: counter ${EVENTS_SEQ_COUNTER} missing after increment`,
+            );
+          }
+          const payload: Record<string, unknown> = {
+            workflowId,
+            actor,
+            completedAt: ts,
+          };
+          if (status !== undefined) payload.status = status;
+          if ("evidence" in action && action.evidence !== undefined) {
+            payload.evidence = action.evidence;
+          }
+          // Serialized here (inside the transaction): an unserializable
+          // payload (e.g. a circular `evidence`) aborts and rolls back the
+          // row + item write with it — atomic, never a half-finalize.
+          await tx.execute(
+            "INSERT INTO events (seq, ts, run_id, work_item_id, type, level, data) VALUES (?, ?, NULL, ?, 'target-accepted', 'info', ?)",
+            [Number(next), ts, target.id, JSON.stringify(payload)],
+          );
+        }
+      }),
+    );
   }
 
   /** Select work items via the compiled selector (SQL push-down + meta post-filter). */

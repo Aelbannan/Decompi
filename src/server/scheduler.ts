@@ -65,6 +65,7 @@ import type { Selector } from "../types.js";
 import { PipelineEngine, type RunContext } from "../pipeline/engine.js";
 import { runPipelineWithBudget } from "../pipeline/run.js";
 import { WorkItemRepo } from "../target/work-item.js";
+import { applyScope, type RunScope } from "../workflow/scope.js";
 
 /** `runs.status` vocabulary (schema.sql). */
 export type RunStatus = "queued" | "running" | "paused" | "done" | "failed" | "cancelled";
@@ -77,6 +78,10 @@ export interface RunSpec {
   model: string;
   /** Declarative selection for `plan`/`select` steps (defaults to all). */
   selector?: Selector;
+  /** Explicit run scope (SPEC §6): target/unit id allowlists, AND-ed into the
+   * run's selection (`targetIds` → `filter.ids`, `unitIds` → `filter.unit`).
+   * Folded into the persisted `runs.selector` so a restarted run keeps it. */
+  scope?: RunScope;
   /** Whole-run spend cap in integer micro-USD; undefined = unlimited. */
   budgetMicroUsd?: number;
   /**
@@ -330,7 +335,10 @@ export class RunScheduler {
           spec.pipeline,
           this.adapterFor(spec.pipeline),
           spec.model,
-          JSON.stringify(spec.selector ?? {}),
+          // SPEC §6 persistence: the run scope is folded into the stored
+          // selector (targetIds → filter.ids, unitIds → filter.unit) so a
+          // restarted run keeps its scope (applyScope with no scope is a no-op).
+          JSON.stringify(applyScope(spec.selector ?? {}, spec.scope)),
           spec.budgetMicroUsd ?? null,
           now,
         ],
@@ -569,7 +577,10 @@ export class RunScheduler {
           ? { budgetMicroUsd: spec.budgetMicroUsd }
           : {}),
         verifiers: this.verifiers ?? {},
-        select: (selector: Selector) => this.repo.list(selector),
+        // SPEC §6: intersect the run scope at the store level — every plan/
+        // select selector is AND-ed with the scope's target/unit allowlists
+        // (a restarted run carries the scope in its folded `runs.selector`).
+        select: (selector: Selector) => this.repo.list(applyScope(selector, spec.scope)),
         onBudgetSpent: (spent) => {
           spentMicroUsd = spent;
         },

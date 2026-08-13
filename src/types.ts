@@ -37,6 +37,8 @@ export interface Selector {
     status?: string[];
     lifecycle?: string[];
     kind?: string[];
+    /** Explicit target-id allowlist (SPEC §6 run scope; ANDs with the rest). */
+    ids?: string[];
     unit?: string[];
     region?: string[];
     symbol?: string; // promoted column
