@@ -1,0 +1,128 @@
+{
+ "token": "CExchangeWin",
+ "source": "// Auto-scaffolded catalog TU for kyoshin/CExchangeWin\n// Replace stubs with high-level C/C++ during decomp.\n\n#include <types.h>\n#include <stdio.h>\n#include <revolution/tpl/TPL.h>\n#include \"kyoshin/CExchangeWin.hpp\"\n#include \"kyoshin/code_80135FDC.hpp\"\n#include \"kyoshin/CUICfManager.hpp\"\n#include \"kyoshin/cf/CfGameManager.hpp\"\n#include \"monolib/device/CDeviceFile.hpp\"\n#include \"monolib/device/CDeviceFont.hpp\"\n#include \"monolib/lib/CLibLayout.hpp\"\n#include \"monolib/util/MemManager.hpp\"\n#include \"monolib/work/CEventFile.hpp\"\nextern const char lbl_eu_8050A740[];\nextern void func_80137924(void*, void*, void*, void*);\nextern void func_80138078(u32);\nextern const float lbl_eu_80668610;\n\n\n\nextern \"C\" CExchangeWin* __ct__CExchangeWin(CExchangeWin* self) {\n    self->mVtbl = lbl_eu_80536640;\n    __ct__17UnkClass_8045F564Fv(&self->mMemRegion);\n    self->mFileHandle = nullptr;\n    self->mAccessor = nullptr;\n    self->mLayout = nullptr;\n    self->mAnimTransform = nullptr;\n    self->field_24 = 0;\n    self->field_25 = 1;\n    self->_26 = 0;\n    self->field_27 = 1;\n    return self;\n}\n\n// Destructor - compiler handles member destructors automatically.\n// The explicit mMemRegion.~UnkClass_8045F564() call is NOT added here\n// because MWCC generates it automatically for non-trivial members,\n// and adding it explicitly causes a double call.\nCExchangeWin::~CExchangeWin() {\n}\n\nu8 CExchangeWin::getField25() { return field_25; }\n\nu8 CExchangeWin::getField24() { return field_24; }\n\nint CExchangeWin::getField27() { return field_27; }\n\n// If _26 is already non-zero, do nothing; otherwise initialize state and fire event 0xd\nextern \"C\" void func_8022D0A4(CExchangeWin* self) {\n    if (self->_26 != 0) {\n        return;\n    }\n    self->_26 = 1;\n    self->field_27 = 0;\n    self->field_24 = 1;\n    func_80138078(0xd);\n}\n\nextern \"C\" __attribute__((noinline)) void func_8022D1F8(CExchangeWin* self) {\n    float f = lbl_eu_80668610;\n    if (func_80137444(self->mAnimTransform, f)) {\n        self->_26 = 2;\n        self->field_27 = 1;\n    }\n}\n\nextern \"C\" void func_8022D244(CExchangeWin* self) {\n    float f = lbl_eu_80668610;\n    if (func_80137510(self->mAnimTransform, f)) {\n        self->_26 = 0;\n        self->field_27 = 1;\n        self->field_24 = 0;\n    }\n}\n\n// OnFileEvent - loads the layout from a file, sets up fonts, animations,\n// text fields, and a texture resource with pane sizing from TPL dimensions.\nbool CExchangeWin::OnFileEvent(CEventFile* pEventFile) {\n    if (mFileHandle != pEventFile->mFileHandle) {\n        return false;\n    }\n\n    mMemRegion.createRegion(\n        mtl::MemManager::getHandleMEM2(),\n        0x8000,\n        &lbl_eu_8050A740[0x4e],\n        0\n    );\n\n    Class_8045F858 helper(&mMemRegion);\n\n    void* arcData = mFileHandle->mData;\n    mFileHandle->mData = nullptr;\n    mtl::MemManager::func_80434A4C(false);\n\n    mAccessor = CLibLayout::createArcResourceAccessor();\n    mAccessor->Attach(arcData, &lbl_eu_8050A740[0x5b]);\n\n    func_80136E84(&mLayout, mAccessor, &lbl_eu_8050A740[0x5f]);\n    func_80136F08(mLayout, &mAnimTransform, mAccessor,\n                  (char*)&lbl_eu_8050A740[0x78]);\n\n    nw4r::lyt::Pane* rootPane = mLayout->GetRootPane();\n    void* fontObj = CDeviceFont::func_80452C10(1, mLayout);\n    typedef u32 (*FontVFn)(void*);\n    u32 fontResult =\n        (*reinterpret_cast<FontVFn**>(fontObj))[0x24 / 4](fontObj);\n    func_8013676C(rootPane, fontResult);\n\n    mLayout->SetAnimationEnable(mAnimTransform, true);\n    mLayout->Animate(0);\n\n    // Set text fields from message table\n    char* t1 =\n        (char*)func_80136190((char*)&lbl_eu_8050A740[0x94],\n                       (char*)&lbl_eu_8050A740[0x9d], 0x24);\n    func_80136B4C(mLayout, (char*)&lbl_eu_8050A740[0xa2], t1, 0);\n\n    char* t2 =\n        (char*)func_80136190((char*)&lbl_eu_8050A740[0x94],\n                       (char*)&lbl_eu_8050A740[0x9d], 0x25);\n    func_80136B4C(mLayout, (char*)&lbl_eu_8050A740[0xaf], t2, 0);\n\n    char* t3 =\n        (char*)func_80136190((char*)&lbl_eu_8050A740[0x94],\n                       (char*)&lbl_eu_8050A740[0x9d], 0x26);\n    func_80136B4C(mLayout, (char*)&lbl_eu_8050A740[0xba], t3, 0);\n\n    char* t4 =\n        (char*)func_80136190((char*)&lbl_eu_8050A740[0xc5],\n                       (char*)&lbl_eu_8050A740[0xd3], 0x2b);\n    func_80136B4C(mLayout, (char*)&lbl_eu_8050A740[0xd8], t4, 0);\n\n    // Choose file ID based on game manager state\n    const char* fileID = &lbl_eu_8050A740[0xed];\n    if (cf::CfGameManager::func_80086F9C(-1) != 0) {\n        fileID = &lbl_eu_8050A740[0xe4];\n    }\n\n    u16 keyVal =\n        func_8013606C((char*)&lbl_eu_8050A740[0xc5], (char*)fileID, 0x2b);\n    char* name = func_80138F78(keyVal);\n\n    nw4r::lyt::ArcResourceAccessor* resAcc =\n        CUICfManager::func_801355F4();\n    TPLPalette* resource = (TPLPalette*)resAcc->GetResource(\n        nw4r::lyt::ArcResourceAccessor::RES_TYPE_TEXTURE, name, nullptr);\n\n    if (resource != nullptr) {\n        func_80137E7C(mLayout, (char*)&lbl_eu_8050A740[0xf6], resource);\n\n        nw4r::lyt::Pane* pane = mLayout->GetRootPane()->FindPaneByName(\n            (char*)&lbl_eu_8050A740[0xf6], true);\n        if (pane != nullptr) {\n            TPLHeader* header = resource->descriptorArray->textureHeader;\n            nw4r::lyt::Size& size =\n                const_cast<nw4r::lyt::Size&>(pane->GetSize());\n            size.width = (f32)header->width;\n            size.height = (f32)header->height;\n        }\n    }\n\n    if (mLayout != nullptr) {\n        field_25 = 1;\n    }\n\n    mFileHandle = nullptr;\n    mMemRegion.func_8045F810();\n\n    return true;\n}\n\n// Stub functions needed by CItemBoxGrid\nextern \"C\" void func_8022D0D0(CExchangeWin* self) {\n    CExchangeWin* s = self;\n    if (s->_26 != 2) {\n        return;\n    }\n    s->_26 = 3;\n    s->field_27 = 0;\n    func_80138078(0xe);\n}\nextern \"C\" void func_8022D19C(CExchangeWin* self, char* text1, char* text2) {\n    func_80136B4C(self->mLayout, (char*)&lbl_eu_8050A740[0x34], text1, 0);\n    func_80136B4C(self->mLayout, (char*)&lbl_eu_8050A740[0x41], text2, 0);\n}\n\nextern \"C\" void func_8022D0F8(void* dst, CExchangeWin* src, u8 val) {\n    char buf[40];\n    CExchangeWin* win;\n    nw4r::lyt::Pane* pane1;\n    nw4r::lyt::Pane* pane2;\n\n    win = src;\n    sprintf(buf, &lbl_eu_8050A740[0x18], val + 1);\n    pane1 = win->mLayout->GetRootPane()->FindPaneByName(buf, true);\n    pane2 = win->mLayout->GetRootPane()->FindPaneByName(&lbl_eu_8050A740[0x25], true);\n    func_80137924(dst, pane1, pane2, win->mLayout->GetRootPane());\n}\nextern \"C\" void func_8022CF2C(CExchangeWin* self) {\n    self->mFileHandle = CDeviceFile::readFile(\n        mtl::MemManager::getHandleMEM2(),\n        lbl_eu_8050A740,\n        (IWorkEvent*)self,\n        0,\n        0\n    );\n    self->field_25 = 0;\n}\n\n// func_8022CF7C - update loop: drives animation state machine and calls\n// mLayout->Animate(0) when field_24 is set. Dispatches to func_8022D1F8\n// for _26==1 (entering) and func_8022D244 for _26==3 (exiting).\nextern \"C\" void func_8022CF7C(CExchangeWin* self) {\n    if (self->field_24 == 0) {\n        return;\n    }\n    switch (self->_26) {\n    case 1:\n        func_8022D1F8(self);\n        break;\n    case 3:\n        func_8022D244(self);\n        break;\n    }\n    self->mLayout->Animate(0);\n}\n\nextern \"C\" void func_8022CFEC(CExchangeWin* self, nw4r::lyt::DrawInfo* drawInfo) {\n    CExchangeWin* s = self;\n    if (s->field_24 == 0) {\n        return;\n    }\n    if (s->_26 == 0) {\n        return;\n    }\n    func_80137038(s->mLayout, drawInfo, 0, 1);\n}\n\n// func_8022D018 - teardown: releases file handle, destroys the layout,\n// releases the arc resource accessor, and cleans up the memory region.\nextern \"C\" void func_8022D018(CExchangeWin* self) {\n    func_801390E0(&self->mFileHandle);\n    self->field_24 = 0;\n    if (self->mLayout != NULL) {\n        delete self->mLayout;\n        self->mLayout = NULL;\n    }\n    func_80139124(self->mAccessor);\n    self->mMemRegion.func_8045F778();\n}\n",
+ "source_path": "src/kyoshin/CExchangeWin.cpp",
+ "symbols.txt": "__ct__CExchangeWin = .text:0x8022ED68; // type:function size:0x68 scope:global align:4\n__dt__12CExchangeWinFv = .text:0x8022EDD0; // type:function size:0x54 scope:global align:4\ngetField25__12CExchangeWinFv = .text:0x8022EF84; // type:function size:0x8 scope:global align:4\ngetField24__12CExchangeWinFv = .text:0x8022EF8C; // type:function size:0x8 scope:global align:4\ngetField27__12CExchangeWinFv = .text:0x8022EF94; // type:function size:0x8 scope:global align:4\nOnFileEvent__12CExchangeWinFP10CEventFile = .text:0x8022F18C; // type:function size:0x2D8 scope:global align:4\n",
+ "retail_symbols": [
+  "OnFileEvent__12CExchangeWinFP10CEventFile",
+  "__ct__CExchangeWin",
+  "__dt__12CExchangeWinFv",
+  "getField24__12CExchangeWinFv",
+  "getField25__12CExchangeWinFv",
+  "getField27__12CExchangeWinFv"
+ ],
+ "hits": [
+  {
+   "lineno": 23,
+   "name": "__ct__CExchangeWin",
+   "kind": "def-param",
+   "header": "CExchangeWin* __ct__CExchangeWin(CExchangeWin* self)"
+  },
+  {
+   "lineno": 51,
+   "name": "func_8022D0A4",
+   "kind": "def-param",
+   "header": "void func_8022D0A4(CExchangeWin* self)"
+  },
+  {
+   "lineno": 61,
+   "name": "func_8022D1F8",
+   "kind": "def-param",
+   "header": "__attribute__((noinline)) void func_8022D1F8(CExchangeWin* self)"
+  },
+  {
+   "lineno": 69,
+   "name": "func_8022D244",
+   "kind": "def-param",
+   "header": "void func_8022D244(CExchangeWin* self)"
+  },
+  {
+   "lineno": 176,
+   "name": "func_8022D0D0",
+   "kind": "def-param",
+   "header": "void func_8022D0D0(CExchangeWin* self)"
+  },
+  {
+   "lineno": 185,
+   "name": "func_8022D19C",
+   "kind": "def-param",
+   "header": "void func_8022D19C(CExchangeWin* self, char* text1, char* text2)"
+  },
+  {
+   "lineno": 202,
+   "name": "func_8022CF2C",
+   "kind": "def-param",
+   "header": "void func_8022CF2C(CExchangeWin* self)"
+  },
+  {
+   "lineno": 216,
+   "name": "func_8022CF7C",
+   "kind": "def-param",
+   "header": "void func_8022CF7C(CExchangeWin* self)"
+  },
+  {
+   "lineno": 231,
+   "name": "func_8022CFEC",
+   "kind": "def-param",
+   "header": "void func_8022CFEC(CExchangeWin* self, nw4r::lyt::DrawInfo* drawInfo)"
+  },
+  {
+   "lineno": 244,
+   "name": "func_8022D018",
+   "kind": "def-param",
+   "header": "void func_8022D018(CExchangeWin* self)"
+  }
+ ],
+ "recipe": [
+  {
+   "lineno": 23,
+   "name": "__ct__CExchangeWin",
+   "mangled": "__ct__CExchangeWin__12CExchangeWinFv"
+  },
+  {
+   "lineno": 51,
+   "name": "func_8022D0A4",
+   "mangled": "func_8022D0A4__12CExchangeWinFv"
+  },
+  {
+   "lineno": 61,
+   "name": "func_8022D1F8",
+   "mangled": "func_8022D1F8__12CExchangeWinFv"
+  },
+  {
+   "lineno": 69,
+   "name": "func_8022D244",
+   "mangled": "func_8022D244__12CExchangeWinFv"
+  },
+  {
+   "lineno": 176,
+   "name": "func_8022D0D0",
+   "mangled": "func_8022D0D0__12CExchangeWinFv"
+  },
+  {
+   "lineno": 185,
+   "name": "func_8022D19C",
+   "mangled": "func_8022D19C__12CExchangeWinFv"
+  },
+  {
+   "lineno": 202,
+   "name": "func_8022CF2C",
+   "mangled": "func_8022CF2C__12CExchangeWinFv"
+  },
+  {
+   "lineno": 216,
+   "name": "func_8022CF7C",
+   "mangled": "func_8022CF7C__12CExchangeWinFv"
+  },
+  {
+   "lineno": 231,
+   "name": "func_8022CFEC",
+   "mangled": "func_8022CFEC__12CExchangeWinFv"
+  },
+  {
+   "lineno": 244,
+   "name": "func_8022D018",
+   "mangled": "func_8022D018__12CExchangeWinFv"
+  }
+ ]
+}

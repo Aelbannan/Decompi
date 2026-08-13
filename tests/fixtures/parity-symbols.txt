@@ -1,0 +1,10 @@
+wkUpdate__Q219@unnamed@CGame_cpp@12CGameRestartFv = .text:0x8003A1EC; // type:function size:0x50 scope:local align:4
+func_80047814__Q22cf13CfObjectPointFv = .text:0x80047DFC; // type:function size:0x1C scope:global align:4
+func_8004C5E8__13CActParamAnimFv = .text:0x8004CC80; // type:function size:0x4 scope:global align:4
+func_8004CC80 = .text:0x8004D318; // type:function size:0xC scope:global align:4
+func_80137038__FPQ34nw4r3lyt6LayoutPQ34nw4r3lyt8DrawInfoii = .text:0x801379B4; // type:function size:0x218 scope:global align:4
+OnFileEvent__12CExchangeWinFP10CEventFile = .text:0x8022F18C; // type:function size:0x2D8 scope:global align:4
+__dt__12CTaskGameEvtFv = .text:0x80297C4C; // type:function size:0x54 scope:global align:4
+func_80295764 = .text:0x80297D60; // type:function size:0x8 scope:global align:4
+OnFileEvent__12CTaskGameEvtFP10CEventFile = .text:0x80297E64; // type:function size:0x8 scope:global align:4
+func_80295870 = .text:0x80297E6C; // type:function size:0x8 scope:global align:4

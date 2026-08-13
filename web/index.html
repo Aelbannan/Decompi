@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Decompi · control plane</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    background: #0d1117;
+    color: #c9d1d9;
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  h1 { font-size: 15px; font-weight: 600; margin: 0; color: #e6edf3; letter-spacing: 0.04em; }
+  h1 .accent { color: #58a6ff; }
+  .dim { color: #6e7681; }
+  .muted { color: #8b949e; }
+
+  .token-row { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+  .token-row label { color: #8b949e; }
+  #token {
+    width: 300px;
+    background: #161b22;
+    color: #e6edf3;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 4px 8px;
+    font: inherit;
+    font-size: 12px;
+  }
+  #token:focus { outline: none; border-color: #58a6ff; }
+  #token.bad-token { border-color: #f85149; }
+
+  #banner {
+    margin-bottom: 12px;
+    padding: 8px 12px;
+    border: 1px solid #f85149;
+    background: rgba(248, 81, 73, 0.12);
+    color: #ffa198;
+    border-radius: 4px;
+    font-size: 12px;
+  }
+  #banner.is-auth { border-color: #d29922; background: rgba(210, 153, 34, 0.10); color: #d29922; }
+
+  .metrics {
+    display: flex; gap: 0; margin-bottom: 12px;
+    border: 1px solid #30363d; border-radius: 6px; overflow: hidden;
+    background: #161b22;
+  }
+  .metric {
+    padding: 8px 14px;
+    color: #8b949e;
+    border-right: 1px solid #30363d;
+    white-space: nowrap;
+  }
+  .metric:last-child { border-right: none; }
+  .metric strong { color: #e6edf3; font-weight: 600; }
+
+  .layout { display: grid; grid-template-columns: minmax(380px, 5fr) minmax(0, 7fr); gap: 12px; align-items: start; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+
+  .panel {
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    background: #161b22;
+    padding: 12px;
+    min-width: 0;
+  }
+  .panel h2 {
+    margin: 0 0 10px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #8b949e;
+  }
+
+  form { display: grid; gap: 8px; margin-bottom: 16px; }
+  form label { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+  form input[type="text"], form input[type="number"], form textarea {
+    background: #0d1117;
+    color: #e6edf3;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 5px 8px;
+    font: inherit;
+    font-size: 12px;
+    width: 100%;
+  }
+  form input:focus, form textarea:focus { outline: none; border-color: #58a6ff; }
+  form textarea { resize: vertical; min-height: 64px; font-size: 11px; }
+  form button {
+    background: #238636;
+    color: #fff;
+    border: 1px solid #2ea043;
+    border-radius: 4px;
+    padding: 6px 12px;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    justify-self: start;
+  }
+  form button:hover { background: #2ea043; }
+
+  .table-wrap { overflow: auto; max-height: 62vh; border: 1px solid #30363d; border-radius: 6px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  thead th {
+    position: sticky; top: 0;
+    background: #21262d;
+    color: #8b949e;
+    text-align: left;
+    padding: 6px 10px;
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border-bottom: 1px solid #30363d;
+    white-space: nowrap;
+  }
+  tbody td { padding: 6px 10px; border-bottom: 1px solid #21262d; white-space: nowrap; vertical-align: middle; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: #1c2128; }
+  tbody tr.selected { background: rgba(88, 166, 255, 0.10); }
+  tbody tr.selected td { color: #e6edf3; }
+
+  .badge {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 10px;
+    font-size: 11px;
+    border: 1px solid;
+    line-height: 1.5;
+  }
+  .status-queued    { color: #8b949e; border-color: #484f58; }
+  .status-running   { color: #3fb950; border-color: #2ea043; }
+  .status-paused    { color: #d29922; border-color: #9e6a03; }
+  .status-done      { color: #58a6ff; border-color: #1f6feb; }
+  .status-failed    { color: #f85149; border-color: #da3633; }
+  .status-cancelled { color: #8b949e; border-color: #484f58; }
+
+  #run-meta { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-bottom: 10px; font-size: 12px; }
+  #run-meta .dim { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  #events { max-height: 62vh; overflow: auto; border: 1px solid #30363d; border-radius: 6px; background: #0d1117; }
+  .event { padding: 6px 10px; border-bottom: 1px solid #21262d; }
+  .event-head { font-size: 11px; color: #8b949e; }
+  .event-data {
+    margin: 4px 0 0;
+    padding: 6px 8px;
+    background: #161b22;
+    border-radius: 4px;
+    font-size: 11px;
+    color: #c9d1d9;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .level-error { background: rgba(248, 81, 73, 0.06); }
+  .level-error .event-head { color: #f85149; }
+  .level-warn { background: rgba(210, 153, 34, 0.06); }
+  .level-warn .event-head { color: #d29922; }
+  .level-debug .event-head { color: #6e7681; }
+  .placeholder { padding: 24px 12px; color: #6e7681; text-align: center; }
+</style>
+</head>
+<body>
+  <header>
+    <h1><span class="accent">decompi</span> · control plane</h1>
+    <div class="token-row">
+      <label for="token">token</label>
+      <input id="token" type="text" autocomplete="off" spellcheck="false"
+             placeholder="bearer token (Authorization: Bearer &lt;token&gt;)" value="">
+    </div>
+  </header>
+
+  <div id="banner" class="hidden"></div>
+
+  <div class="metrics" id="metrics"></div>
+
+  <div class="layout">
+    <section class="panel">
+      <h2>New run</h2>
+      <form id="run-form">
+        <label for="pipeline">pipeline</label>
+        <input id="pipeline" type="text" placeholder="e.g. match" required>
+        <label for="model">model</label>
+        <input id="model" type="text" placeholder="model directory name" required>
+        <label for="selector">selector (JSON object, optional)</label>
+        <textarea id="selector" placeholder='e.g. {"unit":"kyoshin/CGame"}'></textarea>
+        <label for="budget">budget (micro-USD, optional)</label>
+        <input id="budget" type="number" min="0" step="1" placeholder="e.g. 500000">
+        <button type="submit">start run</button>
+      </form>
+
+      <h2>Runs <span class="dim" id="runs-count"></span></h2>
+      <div class="table-wrap">
+        <table id="runs-table">
+          <thead>
+            <tr>
+              <th>id</th>
+              <th>pipeline</th>
+              <th>model</th>
+              <th>status</th>
+              <th>budget (µUSD)</th>
+              <th>created</th>
+              <th>finished</th>
+            </tr>
+          </thead>
+          <tbody id="runs-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Run detail</h2>
+      <div id="run-meta"></div>
+      <div id="events"><div class="placeholder">select a run to stream its events</div></div>
+    </section>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

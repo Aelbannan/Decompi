@@ -1,0 +1,73 @@
+{
+ "source": "// kyoshin/CTaskGameEvt.cpp\n// CTaskGameEvt task wrapper: CProcess-derived task that hosts a scene render\n// callback and a small state flag set.\n\n#include \"kyoshin/CTaskGameEvt.hpp\"\n\n#include \"monolib/work/CWorkThreadSystem.hpp\"\n\n// CTTask<CTaskGameEvt> out-of-line Move/Draw/dtors (retail emits these as\n// standalone functions; the inline CTTask header copy would mark them inline).\n#pragma optimize_for_size on\ntemplate <>\nCTTask<CTaskGameEvt>::~CTTask() {}\n#pragma optimize_for_size off\n\ntemplate <>\nvoid CTTask<CTaskGameEvt>::Move() {\n    if (mMoveFunc) {\n        (static_cast<CTaskGameEvt*>(this)->*mMoveFunc)();\n    }\n}\n\ntemplate <>\nvoid CTTask<CTaskGameEvt>::Draw() {\n    if (mDrawFunc) {\n        (static_cast<CTaskGameEvt*>(this)->*mDrawFunc)();\n    }\n}\n\n// ---------------------------------------------------------------------------\n// Non-target glue stubs (preserved from scaffold; not part of the match set).\n// ---------------------------------------------------------------------------\n\nextern \"C\" int func_80295764(void* self);\n\nextern \"C\" void OnFileEvent__12CTaskGameEvtFP10CEventFile(void* self) { ((void(*)(void*))func_80295764)((char*)self - 0x54); }\n\n// Tail-call wrappers into the cf event-task helper calls.\nvoid func_802956A4(void) { func_80165038(); }\n\nvoid func_802956A8(void) { func_80164CFC(); }\n\nextern \"C\" void cbRenderBefore__12CTaskGameEvtFv(void* self) { (void)self; }\nextern \"C\" void __dt__12CTaskGameEvtFv(void*, int);\n\nextern \"C\" int func_80295764(void* self) { (void)self; return 0; }\n\nextern \"C\" void func_80295870(void* self) { ((void(*)(void*))__dt__12CTaskGameEvtFv)((char*)self - 0x54); }\nextern \"C\" void func_80295878(void* self) { ((void(*)(void*))cbRenderBefore__12CTaskGameEvtFv)((char*)self - 0x58); }\nextern \"C\" void func_80295880(void* self) { ((void(*)(void*))__dt__12CTaskGameEvtFv)((char*)self - 0x58); }\n\n// ---------------------------------------------------------------------------\n// Target members.\n// ---------------------------------------------------------------------------\n\n// Retail constructor `__ct__CTaskGameEvt` is a *stripped* symbol (no length\n// mangling), reconstructed as a free function (cf. CTaskGameCf / CfTaskMain):\n// it calls the CProcess base ctor, then performs the in-place vtable / NULL\n// PTMF / field setup inline so every store matches retail ordering. Written as\n// a free function (not a C++ member ctor) so no `__ct__12CTaskGameEvtFi`\n// symbol is emitted and the interim CTTask vtable write can be reproduced.\n#pragma optimize_for_size on\n__declspec(noinline) CTaskGameEvt* __ct__CTaskGameEvt(CTaskGameEvt* pThis, int arg) {\n    __ct__8CProcessFv(pThis);\n\n    // Final CTaskGameEvt vtable base + its two sub-vtable pointers (kept as the\n    // label pointer so it is a first-class pointer live to the final 0x10 store;\n    // retail holds the base in r6, sub-vtables in r5/r4, PTMF temps in r7/r8).\n    char* vtbl = lbl_eu_80538C00;\n    u32 v54 = (u32)(vtbl + 0x24);\n    u32 v58 = (u32)(vtbl + 0xac);\n\n    u32* p = reinterpret_cast<u32*>(pThis);\n\n    // Interim CTTask<CTaskGameEvt> vtable (overwritten later).\n    p[4] = reinterpret_cast<u32>(lbl_eu_80538CE8);\n\n    // NULL PTMF -> mMoveFunc (0x3C) / mDrawFunc (0x48) in the retail store\n    // order 0x40,0x3C,0x44 then 0x4C,0x48,0x50. Post-increment derefs of a local\n    // pointer make MWCC fold the first access into `lwzu` (single base register\n    // r9 via @ha/@l, offsets on the rest) instead of an extra `addi`-materialised\n    // pointer - cf. MWCC_REFERENCE btm_sco_init lwzu shape. The stores into p can\n    // alias the non-const global, forcing the 4..6/4..5 reloads between slots.\n    const u32* src = __ptmf_null;\n    u32 w0 = *src++;\n    u32 w1 = *src++;\n    p[0x10] = w1;        // 0x40 mMoveFunc[1]\n    p[0xF] = w0;         // 0x3C mMoveFunc[0]\n    u32 w2 = *src++;     // load [2] after the w1 store (retail lwz r7,8(r9) late)\n    p[0x11] = w2;        // 0x44 mMoveFunc[2]\n    src = __ptmf_null;\n    w1 = *src++;\n    w0 = *src++;\n    p[0x13] = w0;        // 0x4C mDrawFunc[1]\n    p[0x12] = w1;        // 0x48 mDrawFunc[0]\n    w2 = *src++;\n    p[0x14] = w2;        // 0x50 mDrawFunc[2]\n\n    // Final CTaskGameEvt vtable + member fields.\n    p[4] = (u32)vtbl;\n    p[0x15] = v54;       // 0x54 field_54\n    p[0x16] = v58;       // 0x58 mRenderCB (IScnRender vtable)\n    p[0x17] = static_cast<u32>(arg); // 0x5C mScene\n    p[0x18] = 0;             // 0x60 mFlags\n\n    return pThis;\n}\n#pragma optimize_for_size off\n\n#pragma optimize_for_size on\nCTaskGameEvt::~CTaskGameEvt() {}\n#pragma optimize_for_size off\n\nvoid CTaskGameEvt::Init() {\n    IScnRender* rp = reinterpret_cast<IScnRender*>(this); // default: null-this -> this(0)\n    if (this) rp = reinterpret_cast<IScnRender*>(&mRenderCB); // override: this + 0x58\n    mScene->addRenderCB(rp, 11, 0);\n}\n\nvoid CTaskGameEvt::Term() {\n    IScnRender* rp = reinterpret_cast<IScnRender*>(this); // default: null-this -> this(0)\n    if (this) rp = reinterpret_cast<IScnRender*>(&mRenderCB); // override: this + 0x58\n    mScene->removeRenderCB(rp);\n}\n\nvoid CTaskGameEvt::Move() {\n    u32 flags = mFlags;\n    if ((flags & 0x2) && !(flags & 0x1) &&\n        cf::CTaskGameCf::getInstance() != 0 &&\n        func_80164C48() != 0) {\n        if (func_80164954()) {\n            mFlags |= 1;\n        } else {\n            mFlags &= ~1;\n        }\n    }\n}\n\n#pragma optimize_for_size on\nCTaskGameEvt* CTaskGameEvt::create(CProcess* pParent, int arg) {\n    u32 handle = CWorkThreadSystem::getWorkMem();\n    CTaskGameEvt* obj = (CTaskGameEvt*)mtl::MemManager::allocate(0x64, handle);\n    if (obj) {\n        obj = __ct__CTaskGameEvt(obj, arg);\n    }\n    obj->Regist(pParent, false);\n    return obj;\n}\n#pragma optimize_for_size off",
+ "source_path": "src/kyoshin/CTaskGameEvt.cpp",
+ "cases": [
+  {
+   "name": "func_80137038",
+   "category": "drift",
+   "resolved": "func_80137038__FPQ34nw4r3lyt6LayoutPQ34nw4r3lyt8DrawInfoii"
+  },
+  {
+   "name": "__ct__11CGameFv",
+   "category": "invented",
+   "resolved": null
+  },
+  {
+   "name": "OnFileEvent__12CExchangeWinFP10CEventFile",
+   "category": "exact",
+   "resolved": "us"
+  },
+  {
+   "name": "wkUpdate__Q219@unnamed@CGame_cpp@12CGameRestartFv",
+   "category": "exact",
+   "resolved": "us"
+  },
+  {
+   "name": "func_80047814",
+   "category": "drift",
+   "resolved": "func_80047814__Q22cf13CfObjectPointFv"
+  },
+  {
+   "name": "func_8004CC80",
+   "category": "exact",
+   "resolved": "us",
+   "jp_stale": true
+  },
+  {
+   "name": "func_80295764",
+   "category": "exact",
+   "resolved": "us"
+  },
+  {
+   "name": "CGame_DoThing",
+   "category": "invented",
+   "resolved": null
+  },
+  {
+   "name": "OnFileEvent__12CTaskGameEvtFP10CEventFile",
+   "category": "exact",
+   "resolved": "us"
+  },
+  {
+   "name": "func_80295870",
+   "category": "exact",
+   "resolved": "us"
+  },
+  {
+   "name": "__dt__12CTaskGameEvtFv",
+   "category": "exact",
+   "resolved": "us"
+  }
+ ],
+ "sourceEntries": [
+  {
+   "lineno": 34,
+   "name": "func_80295764",
+   "raw": "extern \"C\" int func_80295764(void* self);",
+   "category": "exact",
+   "resolved": "us",
+   "memberCandidateHint": true,
+   "self_style": true
+  }
+ ]
+}

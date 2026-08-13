@@ -1,0 +1,65 @@
+{
+ "symbols": [
+  {
+   "symbol": "func_80086D90__Q22cf13CfGameManagerFv",
+   "call_sites": 1,
+   "callers": [
+    [
+     "kyoshin/plugin/ocCfp.s",
+     "func_80045694",
+     83
+    ]
+   ],
+   "r3_provenance": {
+    "CLRLWI": 1
+   },
+   "callee": {
+    "deref": false,
+    "deref_max_offset": 0,
+    "stores": false,
+    "vtable_dispatch": false,
+    "integer_only": false,
+    "r3_ops": 0,
+    "derefs": 0
+   },
+   "binary_params": {
+    "gprs": [],
+    "fprs": []
+   },
+   "verdict": "NOT non-static member (r3 never used as object base)",
+   "body_present": true,
+   "vtable_hints": []
+  },
+  {
+   "symbol": "func_80086D94__Q22cf13CfGameManagerFv",
+   "call_sites": 1,
+   "callers": [
+    [
+     "kyoshin/plugin/ocCfp.s",
+     "func_800456C4",
+     95
+    ]
+   ],
+   "r3_provenance": {
+    "CLRLWI": 1
+   },
+   "callee": {
+    "deref": false,
+    "deref_max_offset": 0,
+    "stores": false,
+    "vtable_dispatch": false,
+    "integer_only": false,
+    "r3_ops": 0,
+    "derefs": 0
+   },
+   "binary_params": {
+    "gprs": [],
+    "fprs": []
+   },
+   "verdict": "NOT non-static member (r3 never used as object base)",
+   "body_present": true,
+   "vtable_hints": []
+  }
+ ],
+ "symbols.txt": "func_80086D90__Q22cf13CfGameManagerFv = .text:0x80087768; // type:function size:0x4 scope:global align:4\nfunc_80086D94__Q22cf13CfGameManagerFv = .text:0x8008776C; // type:function size:0x4 scope:global align:4\n"
+}

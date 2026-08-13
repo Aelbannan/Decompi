@@ -1,0 +1,28 @@
+{
+  "name": "decompi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Decompi — game-agnostic decomp-matching orchestration harness built on the pi SDK.",
+  "bin": {
+    "decompi": "dist/src/cli/index.js"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "build": "tsc && node -e \"require('node:fs').copyFileSync('src/core/store/schema.sql','dist/src/core/store/schema.sql')\" && node -e \"require('node:fs').copyFileSync('adapters/xenoblade/diff-engine.py','dist/adapters/xenoblade/diff-engine.py')\"",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"tests/**/*.test.ts\""
+  },
+  "dependencies": {
+    "tree-sitter": "0.22.1",
+    "tree-sitter-cpp": "^0.23.4"
+  },
+  "//": "tree-sitter is pinned EXACT (not ^ / ~): 0.22.2+ tightened the Language type to a self-referential Language, which breaks `tsc` against tree-sitter-cpp@0.23.4's `language: unknown` export (verified: ~0.22.1 resolves to 0.22.4 → typecheck fails in src/parse/cpp/tree.ts). A range also cannot install at all: a clean `npm install` hits ERESOLVE because tree-sitter-cpp@0.23.4 declares peerOptional tree-sitter@^0.21.1 — use --legacy-peer-deps. Runtime grammar behaviour is identical (tree-sitter-cpp 0.23.4); 0.22.1 lifts the 32 KiB parse-size limit of 0.21.1 (see docs/m1a-parity.md).",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
