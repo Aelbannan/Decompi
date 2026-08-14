@@ -38,12 +38,13 @@
  * Lifecycle/status transitions are store-owned (M2); this engine partitions
  * items and lets verifiers set `status`/`evidence` themselves.
  */
+import { z } from "zod";
 import type { Selector, Verifier, WorkItem } from "../types.js";
 import type { AgentResult, AgentRuntime, SessionUsage } from "../agent/runtime.js";
 import { PromptBuilder, type PromptSpec } from "../prompt/builder.js";
 import type { Pipeline, Route, Step, StepCtx, StepOutcome, Trigger } from "./types.js";
-import type { WorkflowConfig } from "../workflow/types.js";
-import type { WorkflowCompletionStore } from "../workflow/completions.js";
+import type { Tool, WorkflowConfig } from "../workflow/types.js";
+import type { WorkflowStatusStore } from "../workflow/status.js";
 import type { HelperRegistry } from "../workflow/helpers.js";
 
 /** One executed agent turn: resolved model, final text, and token usage. */
@@ -76,13 +77,14 @@ export interface RunContext {
    */
   finalize?: (item: WorkItem, action: unknown) => Promise<void>;
   /**
-   * Workflow completion store (SPEC §5): when the run supplies no
+   * Workflow status store (SPEC §A.3): when the run supplies no
    * `finalize`, accepted `{ promote: true }` items record a precise
-   * `(workflow, unit, target)` completion row through it, so a later plan
-   * for the same pipeline/workflow skips them. The daemon's transactional
-   * writer overrides this when wired as `finalize`.
+   * `(workflow, unit, target)` status row through it (status = the action's
+   * status, else the pipeline's compiled `completionStatus`, else "DONE"),
+   * so a later plan for the same pipeline/workflow skips them. The daemon's
+   * transactional writer overrides this when wired as `finalize`.
    */
-  completions?: WorkflowCompletionStore;
+  statusesStore?: WorkflowStatusStore;
   /**
    * Adapter-wide helper registry (SPEC §3): merged into `ctx.helpers` for
    * workflow hooks (before workflow-local helpers, which win). Falls back to
@@ -182,27 +184,35 @@ const NOOP_LOG = (_level: string, _msg: string): void => {};
 const NOOP_FINALIZE = async (_item: WorkItem, _action: unknown): Promise<void> => {};
 
 /**
- * Build the default completion writer for a run with a workflow completion
- * store (SPEC §5): every `{ promote: true }` finalize action records a
- * precise `(workflow, unit, target)` completion row, so a later plan for the
- * same pipeline/workflow skips the target (`isComplete(wf, ·)` — the
- * compile-time capture in `compileWorkflow`). A run-supplied `finalize`
+ * Build the default status writer for a run with a workflow status store
+ * (SPEC §A.4): every `{ promote: true }` finalize action records a precise
+ * `(workflow, unit, target)` status row — status = the action's status,
+ * else the pipeline's compiled `completionStatus`, else "DONE" — so a later
+ * plan for the same pipeline/workflow skips the target (`isDone(wf, ·)` —
+ * the compile-time capture in `compileWorkflow`). A run-supplied `finalize`
  * (e.g. the daemon's transactional writer) always overrides this.
  */
 function storeFinalize(
-  completions: WorkflowCompletionStore,
+  statusesStore: WorkflowStatusStore,
   pipelineId: string,
+  completionStatus: string | undefined,
 ): (item: WorkItem, action: unknown) => Promise<void> {
   return async (item, action) => {
     const promote =
       typeof action === "object" &&
       action !== null &&
       (action as { promote?: unknown }).promote === true;
-    if (!promote) return; // non-promote actions never record a completion row
-    await completions.complete({
+    if (!promote) return; // non-promote actions never record a status row
+    const actionStatus = (action as { status?: unknown }).status;
+    const status =
+      typeof actionStatus === "string" && actionStatus.length > 0
+        ? actionStatus
+        : (completionStatus ?? "DONE");
+    await statusesStore.setStatus({
       workflowId: pipelineId,
       unitId: item.unitId ?? "",
       targetId: item.id,
+      status,
       actor: "run",
       reason: "run-time",
     });
@@ -303,7 +313,9 @@ export class PipelineEngine {
       helpers: ctx0.helpers ?? pipeline.helpers,
       finalize:
         ctx0.finalize ??
-        (ctx0.completions !== undefined ? storeFinalize(ctx0.completions, id) : NOOP_FINALIZE),
+        (ctx0.statusesStore !== undefined
+          ? storeFinalize(ctx0.statusesStore, id, pipeline.completionStatus)
+          : NOOP_FINALIZE),
     };
     state.log("info", `run ${id}: start (model=${ctx0.defaultModel})`);
     const ctx = this.makeCtx(state, ctx0.defaultModel);
@@ -515,16 +527,20 @@ export class PipelineEngine {
    * runtime — the same `createSession`/`prompt` path as `agent` steps — so
    * per-turn pacing, budget checks, and pause apply without re-implementation.
    * `reprompt` decides the verdict: ONLY `accepted` items leave play (each
-   * finalized via `ctx.finalize?.(item, { promote: true })`, a no-op when the
-   * run supplies no writer); `rejected` and absent items STAY in play. The
-   * loop exits when nothing is in play, on `verdict.final`, or once
-   * `turns >= rejectionRetries` (default 1; a per-scope override from
-   * `foreach.setup` wins over the step's value). On `verdict.final` with
-   * `feedback`, the feedback is delivered as ONE final, write-only turn — a
-   * real model call, but its reply is NOT re-evaluated (no reprompt, no
-   * AgentTurn). The still-in-play items surface as rejected so the ENCLOSING
-   * foreach routes them via `onReject` (single routing: the loop never routes
-   * itself).
+   * finalized via the workflow's `complete` decider — the compiled step hook
+   * — or the default `{ promote: true, status: completionStatus }`);
+   * `rejected` and absent items STAY in play. After EVERY prompt() —
+   * including the `final` write-only turn — the engine-owned `finish`
+   * built-in's per-turn ids are drained (SPEC §B.4): unioned into accepted
+   * (finalized with `completionStatus`), removed from inPlay BEFORE the
+   * empty/final/cap checks; unknown ids are logged + ignored. The loop exits
+   * when nothing is in play, on `verdict.final`, or once `turns >=
+   * rejectionRetries` (default 1; a per-scope override from `foreach.setup`
+   * wins over the step's value). On `verdict.final` with `feedback`, the
+   * feedback is delivered as ONE final, write-only turn — a real model call,
+   * but its reply is NOT re-evaluated (no reprompt, no AgentTurn). The
+   * still-in-play items surface as rejected so the ENCLOSING foreach routes
+   * them via `onReject` (single routing: the loop never routes itself).
    */
   private async runAgentLoopStep(
     step: Extract<Step, { kind: "agentLoop" }>,
@@ -540,13 +556,35 @@ export class PipelineEngine {
     // step, so `setup.rejectionRetries` must be able to override it.
     const rejectionRetries = ctx.rejectionRetriesOverride ?? step.rejectionRetries ?? 1;
     const finalize = ctx.finalize ?? NOOP_FINALIZE;
-    // ONE session is held across every turn (SPEC §4). The run-time wrapper
-    // (budget/pacing) applies at session creation AND on each prompt() turn.
+    const completionStatus = step.completionStatus;
+    // ONE session is held across every turn (SPEC §4). The session toolset is
+    // the engine-owned `finish` built-in plus the step's workflow custom tools
+    // (SPEC §B.1/B.4); the allowlist carries every available name. `finish`
+    // records its ids into the mutable per-turn bucket the drain reads after
+    // each prompt (SPEC §B.4), so one long-lived session works across turns.
+    const perTurn: { finished: Set<string> } = { finished: new Set() };
+    const finishSchema = z.object({ targetIds: z.array(z.string()) });
+    const finishTool: Tool<typeof finishSchema> = {
+      name: "finish",
+      description:
+        "Declare one or more in-play target ids as finished: the engine accepts " +
+        "them with the workflow's completion status and removes them from the " +
+        "session's remaining work.",
+      inputSchema: finishSchema,
+      run: async (_ctx, args) => {
+        for (const id of args.targetIds) perTurn.finished.add(id);
+      },
+    };
     let prompt = await step.start(items, ctx);
     const session = await ctx.runtime.createSession({
       model,
       prompt,
-      ...(step.tools !== undefined ? { tools: step.tools } : {}),
+      tools: [
+        finishTool.name,
+        ...(step.tools ?? []),
+        ...(step.customTools ?? []).map((t) => t.name),
+      ],
+      customTools: [finishTool, ...(step.customTools ?? [])],
     });
 
     const accepted: WorkItem[] = [];
@@ -555,7 +593,19 @@ export class PipelineEngine {
 
     while (inPlay.length > 0) {
       turns += 1;
+      perTurn.finished = new Set(); // per-prompt() finish state (SPEC §B.4)
       const result = await session.prompt(prompt);
+      // Drain `finish` BEFORE the reprompt and the empty/final/cap checks
+      // (SPEC §B.4): unioned into accepted (finalized with completionStatus),
+      // removed from inPlay; unknown ids logged + ignored.
+      inPlay = await this.drainFinish(
+        perTurn.finished,
+        inPlay,
+        accepted,
+        finalize,
+        completionStatus,
+        ctx,
+      );
       const turn: AgentTurn = {
         model,
         text: result.finalText,
@@ -571,11 +621,21 @@ export class PipelineEngine {
       const verdict = await step.reprompt(inPlay, ctx, turn);
 
       // Only accepted items leave play; rejected + absent items stay in play
-      // and are described by `feedback` for the next turn.
+      // and are described by `feedback` for the next turn. Each accepted item
+      // goes through the workflow's `complete` decider (SPEC §5.2) — the
+      // compiled step hook — or the default promote-with-completionStatus
+      // action, and is finalized with the resulting CompletionAction.
       const acceptedIds = new Set(verdict.accepted.map((i) => i.id));
       for (const item of verdict.accepted) {
         accepted.push(item);
-        await finalize(item, { promote: true });
+        const action =
+          step.complete !== undefined
+            ? await step.complete(item, ctx)
+            : {
+                promote: true,
+                ...(completionStatus !== undefined ? { status: completionStatus } : {}),
+              };
+        await finalize(item, action);
       }
       inPlay = inPlay.filter((i) => !acceptedIds.has(i.id));
       ctx.log(
@@ -588,10 +648,20 @@ export class PipelineEngine {
         // delivered (logged for span completeness; a real model call that
         // charges the run budget) but the reply is NOT re-evaluated — no
         // reprompt, no AgentTurn — and inPlay routes through the enclosing
-        // foreach exactly once.
+        // foreach exactly once. It is still a prompt(): `finish` ids called
+        // during it are drained before the loop exits (SPEC §B.4).
         if (verdict.feedback) {
           ctx.log("info", "agentLoop: final write-only turn (wrap-up feedback delivered)");
+          perTurn.finished = new Set();
           await session.prompt(verdict.feedback);
+          inPlay = await this.drainFinish(
+            perTurn.finished,
+            inPlay,
+            accepted,
+            finalize,
+            completionStatus,
+            ctx,
+          );
         }
         break;
       }
@@ -600,6 +670,47 @@ export class PipelineEngine {
     }
 
     return { accepted, rejected: inPlay, skipped: [], aborted: false };
+  }
+
+  /**
+   * Drain the engine-owned `finish` built-in's per-turn ids (SPEC §B.4):
+   * union `finished` into `accepted` — each finalized with the step's
+   * `completionStatus` (default promote) — and remove them from `inPlay`
+   * BEFORE the empty/final/cap checks. Ids never in play (already accepted
+   * or bogus) are logged + ignored. Returns the reduced in-play list.
+   */
+  private async drainFinish(
+    finished: ReadonlySet<string>,
+    inPlay: WorkItem[],
+    accepted: WorkItem[],
+    finalize: (item: WorkItem, action: unknown) => Promise<void>,
+    completionStatus: string | undefined,
+    ctx: RunCtx,
+  ): Promise<WorkItem[]> {
+    if (finished.size === 0) return inPlay;
+    const remaining: WorkItem[] = [];
+    const drained: string[] = [];
+    for (const item of inPlay) {
+      if (!finished.has(item.id)) {
+        remaining.push(item);
+        continue;
+      }
+      drained.push(item.id);
+      accepted.push(item);
+      await finalize(item, {
+        promote: true,
+        ...(completionStatus !== undefined ? { status: completionStatus } : {}),
+      });
+    }
+    const unknown = [...finished].filter((id) => !drained.includes(id));
+    if (unknown.length > 0) {
+      ctx.log("warn", `agentLoop: finish ignored unknown id(s): ${unknown.join(", ")}`);
+    }
+    ctx.log(
+      "info",
+      `agentLoop: finish drained ${drained.length} id(s), ${remaining.length} still in play`,
+    );
+    return remaining;
   }
 
   private async runShellStep(

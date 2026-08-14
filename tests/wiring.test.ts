@@ -2,17 +2,18 @@
  * M5 serve cut-over wiring tests: the serve stack assembles the full
  * workflow runtime —
  *
- *  (a) a workflow compiled through the facade with a `WorkflowCompletionStore`
- *      plans OUT completed targets (target-scoped AND unit-scoped rows), so
- *      `plan()` returns only the rest;
+ *  (a) a workflow compiled through the facade with a `WorkflowStatusStore`
+ *      plans OUT done targets (target-scoped AND unit-scoped status rows),
+ *      so `plan()` returns only the rest;
  *  (b) a workflow compiled with the adapter's `registerHelpers` registry gets
  *      a MATERIALIZED `ctx.helpers` in reprompt — built-ins plus the real
  *      xenoblade helpers are callable, via the pipeline-carried registry
  *      default (no `RunContext.helpers` needed);
- *  (c) the scheduler threads `completions` + `helpers` into a real run:
+ *  (c) the scheduler threads `statusesStore` + `helpers` into a real run:
  *      reprompt sees the materialized helpers, and accepted items record
- *      precise completion rows through the engine's default finalize — the
- *      loop closes (accept → complete → later plan skips).
+ *      precise status rows through the engine's default finalize (status =
+ *      the pipeline's compiled `completionStatus`) — the loop closes
+ *      (accept → status → later plan skips).
  *
  * Uses a memory SqliteAdapter + MockAgentRuntime — no live xenoblade repo.
  * Registering the adapter helpers touches no filesystem; only INVOKING a
@@ -27,7 +28,7 @@ import { PipelineEngine } from "../src/pipeline/engine.js";
 import { RunScheduler } from "../src/server/scheduler.js";
 import { WorkItemRepo } from "../src/target/work-item.js";
 import type { ModelSpec, WorkItem } from "../src/types.js";
-import { WorkflowCompletionStore } from "../src/workflow/completions.js";
+import { WorkflowStatusStore } from "../src/workflow/status.js";
 import { Decompi } from "../src/workflow/facade.js";
 import { HelperRegistry } from "../src/workflow/helpers.js";
 import { Workflow } from "../src/workflow/types.js";
@@ -82,15 +83,15 @@ function stubScheduler(result = "stub-run") {
 }
 
 // ---------------------------------------------------------------------------
-// (a) plan() subtracts completed targets (target-scoped + unit-scoped)
+// (a) plan() subtracts done targets (target-scoped + unit-scoped)
 // ---------------------------------------------------------------------------
 
-test("facade-compiled plan() skips completed targets (target-scoped and unit-scoped rows)", async () => {
+test("facade-compiled plan() skips done targets (target-scoped and unit-scoped status rows)", async () => {
   const db = await openDb();
   try {
-    const completions = new WorkflowCompletionStore(db);
+    const statusesStore = new WorkflowStatusStore(db);
     const engine = new PipelineEngine();
-    Decompi.configure({ engine, scheduler: stubScheduler(), completions });
+    Decompi.configure({ engine, scheduler: stubScheduler(), statusesStore });
 
     // What the compiled plan actually handed the run (startPrompt input).
     let planned: string[] = [];
@@ -108,9 +109,9 @@ test("facade-compiled plan() skips completed targets (target-scoped and unit-sco
     const t1 = item("t1", { unitId: "u1" });
     const t2 = item("t2", { unitId: "u1" });
     const t3 = item("t3", { unitId: "u2" });
-    // t1: target-scoped completion row. t3: unit-scoped row (covers u2).
-    await completions.complete({ workflowId: "wiring-plan", targetId: "t1", actor: "manual" });
-    await completions.complete({ workflowId: "wiring-plan", unitId: "u2", actor: "manual" });
+    // t1: target-scoped DONE status row. t3: unit-scoped DONE row (covers u2).
+    await statusesStore.setStatus({ workflowId: "wiring-plan", targetId: "t1", status: "DONE", actor: "manual" });
+    await statusesStore.setStatus({ workflowId: "wiring-plan", unitId: "u2", status: "DONE", actor: "manual" });
 
     const out = await engine.runPipeline("wiring-plan", {
       runtime: new MockAgentRuntime({ flash: FLASH }),
@@ -119,7 +120,7 @@ test("facade-compiled plan() skips completed targets (target-scoped and unit-sco
       finalize: async () => {},
     });
 
-    // plan() subtracted the completed t1 (target row) AND t3 (unit row):
+    // plan() subtracted the done t1 (target row) AND t3 (unit row):
     // only t2 reached the run.
     assert.deepEqual(planned, ["t2"]);
     assert.deepEqual(
@@ -149,7 +150,7 @@ test("compiled workflow reprompt gets a materialized ctx.helpers (adapter helper
     Decompi.configure({
       engine,
       scheduler: stubScheduler(),
-      completions: new WorkflowCompletionStore(db),
+      statusesStore: new WorkflowStatusStore(db),
       helpers: registry,
     });
 
@@ -204,29 +205,29 @@ interface WorkflowHelpersWithProbe {
 }
 
 // ---------------------------------------------------------------------------
-// (c) scheduler threads completions + helpers into a real run
+// (c) scheduler threads statusesStore + helpers into a real run
 // ---------------------------------------------------------------------------
 
-test("scheduler threads completions + helpers into a real run (accepted items record completion rows)", async () => {
+test("scheduler threads statusesStore + helpers into a real run (accepted items record status rows)", async () => {
   const db = await openDb();
-  const completions = new WorkflowCompletionStore(db);
+  const statusesStore = new WorkflowStatusStore(db);
   const registry = new HelperRegistry();
   registerHelpers(registry);
   const engine = new PipelineEngine();
   const rt = new MockAgentRuntime({ flash: FLASH });
   let scheduler: RunScheduler | undefined;
   try {
-    // The serve wiring shape: the SAME completions store + helper registry
+    // The serve wiring shape: the SAME status store + helper registry
     // go to BOTH the scheduler and the facade.
     scheduler = new RunScheduler({
       store: db,
       engine,
       maxParallelRuns: 1,
       runtime: rt,
-      completions,
+      statusesStore,
       helpers: registry,
     });
-    Decompi.configure({ engine, scheduler, completions, helpers: registry });
+    Decompi.configure({ engine, scheduler, statusesStore, helpers: registry });
 
     const seen: Record<string, string> = {};
     const wf = new Workflow({
@@ -253,18 +254,20 @@ test("scheduler threads completions + helpers into a real run (accepted items re
     // → RunState → StepCtx → forwardCtx).
     assert.deepEqual(seen, { log: "function", getFunctionAsm: "function" });
 
-    // Accepted items recorded PRECISE completion rows through the engine's
-    // default finalize (the completions store threaded by the scheduler), so
-    // a later plan for this workflow skips them.
+    // Accepted items recorded PRECISE status rows through the engine's
+    // default finalize (the status store threaded by the scheduler; status =
+    // the pipeline's compiled completionStatus → "DONE"), so a later plan
+    // for this workflow skips them.
     assert.equal(
-      await completions.isComplete("wiring-run", { id: "s1", unitId: "kyoshin/CGame" }),
+      await statusesStore.isDone("wiring-run", { id: "s1", unitId: "kyoshin/CGame" }, ["DONE"]),
       true,
     );
     assert.equal(
-      await completions.isComplete("wiring-run", { id: "s2", unitId: "kyoshin/CGame" }),
+      await statusesStore.isDone("wiring-run", { id: "s2", unitId: "kyoshin/CGame" }, ["DONE"]),
       true,
     );
-    assert.equal((await completions.list("wiring-run")).length, 2);
+    assert.equal((await statusesStore.list("wiring-run")).length, 2);
+    assert.equal((await statusesStore.list("wiring-run"))[0]!.status, "DONE");
   } finally {
     await scheduler?.close();
     db.close();

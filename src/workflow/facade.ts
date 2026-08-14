@@ -13,7 +13,7 @@
 import type { PipelineEngine } from "../pipeline/engine.js";
 import type { RunSpec } from "../server/scheduler.js";
 import type { Selector, WorkItem } from "../types.js";
-import type { WorkflowCompletionStore } from "./completions.js";
+import type { WorkflowStatusStore } from "./status.js";
 import { compileWorkflow } from "./compile.js";
 import { HelperRegistry, type WorkflowHelpers } from "./helpers.js";
 import type { Workflow } from "./types.js";
@@ -35,10 +35,10 @@ export interface DecompiDeps {
   /** Store-backed selector resolver for `select()`; absent until wired. */
   select?: (selector: Selector) => Promise<WorkItem[]>;
   /**
-   * Workflow completion store (SPEC §5): compiled plans skip completed
-   * targets. Absent = plans stay fully selectable (stub-until-daemon).
+   * Workflow status store (SPEC §A.3): compiled plans skip done targets.
+   * Absent = plans stay fully selectable (stub-until-daemon).
    */
-  completions?: WorkflowCompletionStore;
+  statusesStore?: WorkflowStatusStore;
   /**
    * Adapter-wide helper registry (SPEC §3): compiled onto registered
    * workflows as their run default — the engine materializes it into
@@ -70,7 +70,7 @@ class DecompiFacade {
   addWorkflow(w: Workflow): void {
     const deps = this.requireDeps("addWorkflow");
     const { pipeline, fragments } = compileWorkflow(w, {
-      ...(deps.completions !== undefined ? { completions: deps.completions } : {}),
+      ...(deps.statusesStore !== undefined ? { statusesStore: deps.statusesStore } : {}),
       ...(deps.helpers !== undefined ? { helpers: deps.helpers } : {}),
     });
     // SPEC §3: a workflow-local helper shadowing a registered global one is

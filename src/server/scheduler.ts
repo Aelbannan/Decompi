@@ -66,7 +66,7 @@ import { PipelineEngine, type RunContext } from "../pipeline/engine.js";
 import { runPipelineWithBudget } from "../pipeline/run.js";
 import { WorkItemRepo } from "../target/work-item.js";
 import { applyScope, type RunScope } from "../workflow/scope.js";
-import type { WorkflowCompletionStore } from "../workflow/completions.js";
+import type { WorkflowStatusStore } from "../workflow/status.js";
 import type { HelperRegistry } from "../workflow/helpers.js";
 
 /** `runs.status` vocabulary (schema.sql). */
@@ -134,12 +134,13 @@ export interface RunSchedulerOptions {
    * verifier for the builtin match pipeline). */
   verifiers?: RunContext["verifiers"];
   /**
-   * Workflow completion store (SPEC §5): threaded into every run — when the
+   * Workflow status store (SPEC §A.3): threaded into every run — when the
    * run supplies no `finalize`, accepted `{ promote: true }` items record
-   * precise completion rows through it, so a later plan for the same
+   * precise status rows through it (status = the pipeline's compiled
+   * `completionStatus`, default "DONE"), so a later plan for the same
    * workflow skips them.
    */
-  completions?: WorkflowCompletionStore;
+  statusesStore?: WorkflowStatusStore;
   /**
    * Adapter-wide helper registry (SPEC §3): threaded into every run so
    * `forwardCtx` materializes `ctx.helpers` (e.g. the xenoblade coop-tool
@@ -278,7 +279,7 @@ export class RunScheduler {
   private readonly runtime: AgentRuntime;
   private readonly daemon: StoreDaemon | undefined;
   private readonly verifiers: RunContext["verifiers"] | undefined;
-  private readonly completions: WorkflowCompletionStore | undefined;
+  private readonly statusesStore: WorkflowStatusStore | undefined;
   private readonly helpers: HelperRegistry | undefined;
   private readonly maxParallelRuns: number;
   private readonly semaphore: Semaphore;
@@ -311,7 +312,7 @@ export class RunScheduler {
     this.runtime = opts.runtime ?? new MockAgentRuntime();
     this.daemon = opts.daemon;
     this.verifiers = opts.verifiers;
-    this.completions = opts.completions;
+    this.statusesStore = opts.statusesStore;
     this.helpers = opts.helpers;
     this.adapterFor = opts.adapterFor ?? ((pipelineId: string) => pipelineId);
     const cap = opts.maxParallelRuns;
@@ -596,7 +597,7 @@ export class RunScheduler {
           ? { budgetMicroUsd: spec.budgetMicroUsd }
           : {}),
         verifiers: this.verifiers ?? {},
-        ...(this.completions !== undefined ? { completions: this.completions } : {}),
+        ...(this.statusesStore !== undefined ? { statusesStore: this.statusesStore } : {}),
         ...(this.helpers !== undefined ? { helpers: this.helpers } : {}),
         // SPEC §6: intersect the run scope at the store level — every plan/
         // select selector is AND-ed with the scope's target/unit allowlists

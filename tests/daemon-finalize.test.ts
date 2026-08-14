@@ -1,11 +1,13 @@
 /**
- * StoreDaemon.finalizeWorkflowItem tests (SPEC §5.3): the single-transaction
- * completion write — precise completion row (insert-or-ignore) + the
- * `CompletionAction` write on `work_items` + a `target-accepted` event,
- * committed together. Covers: promote (lifecycle+status+row+event),
- * idempotent re-finalize (no duplicate event), `promote:false` (row only),
- * COALESCE status retention, `{status}`-only writes, and whole-transaction
- * rollback when the event payload cannot be serialized.
+ * StoreDaemon.finalizeWorkflowItem tests (SPEC §A.4): the single-transaction
+ * status write — precise status row UPSERT (SPEC §A.2, status =
+ * action.status ?? completionStatus ?? "DONE") + the `CompletionAction`
+ * write on `work_items` + a `target-status` event emitted ONLY on a status
+ * change, committed together. Covers: promote (lifecycle+status+row+event),
+ * same-status re-finalize (no duplicate event), `promote:false` (row only),
+ * COALESCE status retention, `{status}`-only writes, the `completionStatus`
+ * default, and whole-transaction rollback when the event payload cannot be
+ * serialized.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -34,17 +36,18 @@ function workItem(id: string): WorkItem {
   };
 }
 
-interface CompletionRow {
+interface StatusRow {
   workflow_id: string;
   unit_id: string;
   target_id: string;
+  status: string;
   actor: string;
   reason: string | null;
 }
 
-async function completionRows(db: SqliteAdapter): Promise<CompletionRow[]> {
-  return db.query<CompletionRow>(
-    "SELECT workflow_id, unit_id, target_id, actor, reason FROM workflow_completions ORDER BY id",
+async function statusRows(db: SqliteAdapter): Promise<StatusRow[]> {
+  return db.query<StatusRow>(
+    "SELECT workflow_id, unit_id, target_id, status, actor, reason FROM workflow_status ORDER BY updated_at",
   );
 }
 
@@ -76,7 +79,7 @@ async function itemLifecycle(
   return { lifecycle: row.lifecycle, status: row.status };
 }
 
-test("finalizeWorkflowItem promotes lifecycle+status and writes a completion row + event atomically", async () => {
+test("finalizeWorkflowItem promotes lifecycle+status and writes a status row + event atomically", async () => {
   const db = await openDb();
   try {
     const daemon = new StoreDaemon(db);
@@ -89,14 +92,15 @@ test("finalizeWorkflowItem promotes lifecycle+status and writes a completion row
       action: { promote: true, status: "FULL_MATCH" },
     });
 
-    // Completion row: precise form (wf, unit-of-target, target), run-time reason.
-    const completions = await completionRows(db);
-    assert.equal(completions.length, 1);
-    assert.equal(completions[0]!.workflow_id, "wf_match");
-    assert.equal(completions[0]!.unit_id, "kyoshin/CGame");
-    assert.equal(completions[0]!.target_id, "t1");
-    assert.equal(completions[0]!.actor, "run_1");
-    assert.equal(completions[0]!.reason, "run-time");
+    // Status row: precise form (wf, unit-of-target, target), run-time reason.
+    const rows = await statusRows(db);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.workflow_id, "wf_match");
+    assert.equal(rows[0]!.unit_id, "kyoshin/CGame");
+    assert.equal(rows[0]!.target_id, "t1");
+    assert.equal(rows[0]!.status, "FULL_MATCH");
+    assert.equal(rows[0]!.actor, "run_1");
+    assert.equal(rows[0]!.reason, "run-time");
 
     // Work item: promoted to accepted with the action's status.
     assert.deepEqual(await itemLifecycle(db, "t1"), {
@@ -104,22 +108,23 @@ test("finalizeWorkflowItem promotes lifecycle+status and writes a completion row
       status: "FULL_MATCH",
     });
 
-    // Exactly one target-accepted event, carrying workflow + status.
+    // Exactly one target-status event (null → FULL_MATCH), carrying from/to.
     const events = await eventRows(db);
     assert.equal(events.length, 1);
-    assert.equal(events[0]!.type, "target-accepted");
+    assert.equal(events[0]!.type, "target-status");
     assert.equal(events[0]!.work_item_id, "t1");
     const data = JSON.parse(events[0]!.data) as Record<string, unknown>;
     assert.equal(data.workflowId, "wf_match");
     assert.equal(data.status, "FULL_MATCH");
+    assert.equal(data.from, null);
     assert.equal(data.actor, "run_1");
-    assert.match(String(data.completedAt), /^\d{4}-\d{2}-\d{2}T/);
+    assert.match(String(data.updatedAt), /^\d{4}-\d{2}-\d{2}T/);
   } finally {
     db.close();
   }
 });
 
-test("a second finalize is idempotent: no duplicate event, single completion row, item write still applies", async () => {
+test("a same-status second finalize replaces the row but emits no duplicate event", async () => {
   const db = await openDb();
   try {
     const daemon = new StoreDaemon(db);
@@ -134,8 +139,9 @@ test("a second finalize is idempotent: no duplicate event, single completion row
     await daemon.finalizeWorkflowItem(input);
     await daemon.finalizeWorkflowItem(input);
 
-    // One completion row, one event (seq 1 — no re-assignment on re-finalize).
-    assert.equal((await completionRows(db)).length, 1);
+    // One status row (the second finalize UPSERTED the same row), one event
+    // (seq 1 — no event on the same-status re-finalize).
+    assert.equal((await statusRows(db)).length, 1);
     const events = await eventRows(db);
     assert.equal(events.length, 1);
     assert.equal(events[0]!.seq, 1);
@@ -150,7 +156,7 @@ test("a second finalize is idempotent: no duplicate event, single completion row
   }
 });
 
-test("promote:false writes only the completion row (no item write, no event)", async () => {
+test("promote:false writes only the status row (no item write)", async () => {
   const db = await openDb();
   try {
     const daemon = new StoreDaemon(db);
@@ -163,23 +169,28 @@ test("promote:false writes only the completion row (no item write, no event)", a
       action: { promote: false },
     });
 
-    const completions = await completionRows(db);
-    assert.equal(completions.length, 1);
-    assert.equal(completions[0]!.target_id, "t2");
-    assert.equal(completions[0]!.reason, "run-time");
+    // The status row lands with the ladder default (completionStatus
+    // absent → "DONE"); the target-status event fires (null → DONE).
+    const rows = await statusRows(db);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.target_id, "t2");
+    assert.equal(rows[0]!.status, "DONE");
+    assert.equal(rows[0]!.reason, "run-time");
 
-    // No lifecycle/status change, no event.
+    // No lifecycle/status change on the item.
     assert.deepEqual(await itemLifecycle(db, "t2"), {
       lifecycle: "pending",
       status: "NOT_STARTED",
     });
-    assert.deepEqual(await eventRows(db), []);
+    const events = await eventRows(db);
+    assert.equal(events.length, 1);
+    assert.equal(events[0]!.type, "target-status");
   } finally {
     db.close();
   }
 });
 
-test("promote without a status keeps the current status (COALESCE)", async () => {
+test("completionStatus threads through: promote without a status writes the workflow's completion status", async () => {
   const db = await openDb();
   try {
     const daemon = new StoreDaemon(db);
@@ -191,22 +202,27 @@ test("promote without a status keeps the current status (COALESCE)", async () =>
       target: item,
       actor: "run_2",
       action: { promote: true },
+      completionStatus: "FULL_MATCH",
     });
 
-    // Lifecycle promoted; status untouched (COALESCE(?, status) with NULL).
+    // Lifecycle promoted; item status untouched (COALESCE(?, status) with
+    // NULL). The status row carries the threaded completionStatus.
     assert.deepEqual(await itemLifecycle(db, "t3"), {
       lifecycle: "accepted",
       status: "CODE_MATCH",
     });
+    const rows = await statusRows(db);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.status, "FULL_MATCH");
     const events = await eventRows(db);
     assert.equal(events.length, 1);
-    assert.equal((JSON.parse(events[0]!.data) as Record<string, unknown>).status, undefined);
+    assert.equal((JSON.parse(events[0]!.data) as Record<string, unknown>).status, "FULL_MATCH");
   } finally {
     db.close();
   }
 });
 
-test("{ status } alone sets only status: no lifecycle change, no event", async () => {
+test("{ status } alone sets only status: no lifecycle change, event on change", async () => {
   const db = await openDb();
   try {
     const daemon = new StoreDaemon(db);
@@ -223,8 +239,58 @@ test("{ status } alone sets only status: no lifecycle change, no event", async (
       lifecycle: "pending",
       status: "REVIEWED",
     });
-    assert.equal((await completionRows(db)).length, 1);
-    assert.deepEqual(await eventRows(db), []);
+    const rows = await statusRows(db);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.status, "REVIEWED");
+    // null → REVIEWED is a change: exactly one target-status event.
+    const events = await eventRows(db);
+    assert.equal(events.length, 1);
+    assert.equal(events[0]!.type, "target-status");
+    assert.equal((JSON.parse(events[0]!.data) as Record<string, unknown>).status, "REVIEWED");
+  } finally {
+    db.close();
+  }
+});
+
+test("a status CHANGE re-finalize emits a new event (from → to); same-status does not", async () => {
+  const db = await openDb();
+  try {
+    const daemon = new StoreDaemon(db);
+    await daemon.importWorkItems([workItem("t6")]);
+
+    await daemon.finalizeWorkflowItem({
+      workflowId: "wf_ladder",
+      target: workItem("t6"),
+      actor: "run_5",
+      action: { promote: true, status: "CODE_MATCH" },
+    });
+    await daemon.finalizeWorkflowItem({
+      workflowId: "wf_ladder",
+      target: workItem("t6"),
+      actor: "run_5",
+      action: { promote: true, status: "FULL_MATCH" },
+    });
+    await daemon.finalizeWorkflowItem({
+      workflowId: "wf_ladder",
+      target: workItem("t6"),
+      actor: "run_5",
+      action: { promote: true, status: "FULL_MATCH" },
+    });
+
+    // Two events: null → CODE_MATCH and CODE_MATCH → FULL_MATCH. The
+    // same-status third finalize emitted nothing.
+    const events = await eventRows(db);
+    assert.equal(events.length, 2);
+    const statuses = events.map((e) => {
+      const data = JSON.parse(e.data) as { from: string | null; status: string };
+      return { from: data.from, status: data.status };
+    });
+    assert.deepEqual(statuses, [
+      { from: null, status: "CODE_MATCH" },
+      { from: "CODE_MATCH", status: "FULL_MATCH" },
+    ]);
+    assert.equal((await statusRows(db)).length, 1);
+    assert.equal((await statusRows(db))[0]!.status, "FULL_MATCH");
   } finally {
     db.close();
   }
@@ -237,7 +303,7 @@ test("a throwing finalize rolls the whole transaction back (no row, no item writ
     await daemon.importWorkItems([workItem("t5")]);
 
     // An unserializable evidence payload throws inside the transaction —
-    // after the completion-row and item writes — and must roll them all back.
+    // after the status-row and item writes — and must roll them all back.
     const circular: Record<string, unknown> = {};
     circular.self = circular;
     await assert.rejects(
@@ -250,7 +316,7 @@ test("a throwing finalize rolls the whole transaction back (no row, no item writ
       /circular/i,
     );
 
-    assert.deepEqual(await completionRows(db), []);
+    assert.deepEqual(await statusRows(db), []);
     assert.deepEqual(await eventRows(db), []);
     assert.deepEqual(await itemLifecycle(db, "t5"), {
       lifecycle: "pending",

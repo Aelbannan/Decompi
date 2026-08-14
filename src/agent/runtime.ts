@@ -5,6 +5,7 @@
  * module defines the interface consumers compile against.
  */
 import type { ModelSpec } from "../types.js";
+import type { Tool } from "../workflow/types.js";
 
 /** Token-count snapshot for one session (SPEC §14 cost-model buckets). */
 export interface SessionUsage {
@@ -22,6 +23,12 @@ export interface AgentResult {
 
 /** A long-lived agent conversation; `prompt` appends a turn and awaits the reply. */
 export interface AgentSession {
+  /**
+   * One agentic turn (SPEC §B.3): the model may make 0+ tool calls; the
+   * harness/session runs each registered handler and feeds the result back
+   * until the model emits a final answer. Resolves with that final result;
+   * `usage` is CUMULATIVE across the whole turn (every sub-request).
+   */
   prompt(text: string): Promise<AgentResult>;
 }
 
@@ -29,10 +36,15 @@ export interface AgentSession {
 export interface AgentRuntime {
   /** Resolve a models.json name to its ModelSpec, or null if unknown. */
   resolveModel(name: string): Promise<ModelSpec | null>;
-  /** Open a fresh session bound to a model, seeded with an initial prompt. */
+  /**
+   * Open a fresh session bound to a model, seeded with an initial prompt.
+   * `tools` is the NAME allowlist (unchanged shipped meaning); `customTools`
+   * carries the tool DEFINITIONS the session may invoke (SPEC §B.1/B.2).
+   */
   createSession(opts: {
     model: string;
     prompt: string;
     tools?: string[];
+    customTools?: Tool[];
   }): Promise<AgentSession>;
 }

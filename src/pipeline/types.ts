@@ -22,7 +22,7 @@ import type { PromptSpec } from "../prompt/builder.js";
 // Type-only: erased at compile time, so the cycle engine.ts <-> types.ts is safe.
 import type { AgentTurn } from "./engine.js";
 import type { HelperRegistry, ReadonlyStore } from "../workflow/helpers.js";
-import type { WorkflowConfig } from "../workflow/types.js";
+import type { CompletionAction, Tool, WorkflowConfig } from "../workflow/types.js";
 
 /** The most recent agent turn in a scope (set by `agent` steps; shared across foreach forks). */
 export interface LastAgentResult {
@@ -108,6 +108,25 @@ export type Step =
       rejectionRetries?: number;
       model?: string;
       tools?: string[];
+      /**
+       * Workflow custom tools (definitions), assembled with the engine's core
+       * built-ins into the session toolset (SPEC §B.1). Compiled from
+       * `WorkflowDef.customTools`; fragments reuse the compiled loop.
+       */
+      customTools?: Tool[];
+      /**
+       * Status written by the engine's default run-time acceptance finalize
+       * (SPEC §A.1) — the compiled ladder's last status; also the status the
+       * `finish` built-in drains with (SPEC §B.4).
+       */
+      completionStatus?: string;
+      /**
+       * The workflow's `complete` decider, adapted to the engine surface
+       * (SPEC §2/§5.2): called per accepted target; its `CompletionAction` is
+       * what the engine finalizes with (absent = default promote +
+       * `completionStatus`). Compiled from `WorkflowDef.complete`.
+       */
+      complete?: (target: WorkItem, ctx: StepCtx) => Promise<CompletionAction>;
     };
 
 /**
@@ -149,6 +168,13 @@ export interface Pipeline {
    * wins).
    */
   helpers?: HelperRegistry;
+  // ── Status ladder (SPEC §A.1), compiled by the workflow compiler ────────
+  /** The workflow's status ladder (default ["DONE"]). */
+  statuses?: string[];
+  /** Statuses that count as done for plan subtraction (default [last]). */
+  doneStatuses?: string[];
+  /** Status written by the engine's default run-time finalize (default last). */
+  completionStatus?: string;
 }
 
 /** Result of running a step (or a `StepCtx.run` sub-step). */

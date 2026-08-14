@@ -6,13 +6,13 @@
  * the web/ dashboard (index.html + app.js) at `/` — all on 127.0.0.1
  * (SPEC §16 default bind; the API server in api.ts is not modified).
  *
- * Workflow cut-over glue (M5): one `WorkflowCompletionStore` (over the same
+ * Workflow cut-over glue (M5): one `WorkflowStatusStore` (over the same
  * store) and one adapter-wide `HelperRegistry` (the xenoblade coop helpers
  * via `registerHelpers`) are built here and wired end-to-end — the facade
- * compiles workflows with the completions store (compiled plans skip
- * completed targets) and the scheduler threads BOTH into every run, so
- * accepted items record completion rows (a later plan skips them) and
- * `forwardCtx` materializes `ctx.helpers` with the adapter's real helpers.
+ * compiles workflows with the status store (compiled plans skip done
+ * targets) and the scheduler threads BOTH into every run, so accepted
+ * items record status rows (a later plan skips them) and `forwardCtx`
+ * materializes `ctx.helpers` with the adapter's real helpers.
  *
  * Static-file layering: the `createServer` callback of the API server is a
  * plain `request` listener; serve.ts swaps it for a router that serves web/
@@ -37,10 +37,11 @@ import { MockAgentRuntime } from "../agent/mock.js";
 import { PipelineEngine } from "../pipeline/engine.js";
 import { registerMatchPipelines } from "../pipeline/builtin/match.js";
 import { RunScheduler } from "./scheduler.js";
-import { WorkflowCompletionStore } from "../workflow/completions.js";
+import { WorkflowStatusStore } from "../workflow/status.js";
 import { HelperRegistry } from "../workflow/helpers.js";
 import { Decompi } from "../workflow/facade.js";
 import { registerHelpers } from "../../adapters/xenoblade/workflow.js";
+import { MIGRATIONS } from "../core/store/migrations.js";
 import {
   AuthTokenProvider,
   createApiServer,
@@ -235,8 +236,9 @@ export async function startServer(opts: StartServerOptions = {}): Promise<StartS
   let scheduler: RunScheduler | null = null;
   let apiServer: HttpServer | null = null;
   try {
-    // Store: canonical schema (§6.2) on the host-owned adapter.
-    await adapter.migrate([]);
+    // Store: canonical schema (§6.2) + versioned migrations (v1 status
+    // ladder) on the host-owned adapter.
+    await adapter.migrate([...MIGRATIONS]);
 
     // Embedded store daemon: single writer + continuous reap (§5, §6.3).
     daemon = new StoreDaemon(adapter);
@@ -246,12 +248,13 @@ export async function startServer(opts: StartServerOptions = {}): Promise<StartS
     const engine = new PipelineEngine();
     registerMatchPipelines(engine);
 
-    // Workflow completion store (SPEC §5): compiled workflow plans subtract
-    // completed targets (`isComplete(wf, ·)`), and run-accepted items record
-    // precise `(workflow, unit, target)` rows through the scheduler's default
-    // finalize, so a later plan skips them. One instance shared by the
-    // facade (compile-time) and the scheduler (run-time writer).
-    const completions = new WorkflowCompletionStore(adapter);
+    // Workflow status store (SPEC §A): compiled workflow plans subtract
+    // done targets (`isDone(wf, ·, doneStatuses)`), and run-accepted items
+    // record precise `(workflow, unit, target)` status rows through the
+    // scheduler's default finalize (status = the pipeline's compiled
+    // `completionStatus`), so a later plan skips them. One instance shared
+    // by the facade (compile-time) and the scheduler (run-time writer).
+    const statusesStore = new WorkflowStatusStore(adapter);
 
     // Adapter-wide helper registry (SPEC §3): the xenoblade coop-tool helpers
     // (getFunctionAsm / runBatchCycle / structLayout). Registering touches no
@@ -268,15 +271,15 @@ export async function startServer(opts: StartServerOptions = {}): Promise<StartS
       maxParallelRuns: opts.maxParallelRuns ?? DEFAULT_MAX_PARALLEL_RUNS,
       runtime: new MockAgentRuntime(),
       daemon,
-      completions,
+      statusesStore,
       helpers,
     });
 
     // Facade wiring: workflows added through `Decompi.addWorkflow` compile
-    // with the SAME completions store + helper registry — compiled plans skip
-    // completed targets, and the compiled pipeline carries the registry as
-    // its run default (the scheduler also threads both into every run).
-    Decompi.configure({ engine, scheduler, completions, helpers });
+    // with the SAME status store + helper registry — compiled plans skip
+    // done targets, and the compiled pipeline carries the registry as its
+    // run default (the scheduler also threads both into every run).
+    Decompi.configure({ engine, scheduler, statusesStore, helpers });
 
     // Control-plane API with bearer auth (§16). Created WITHOUT a port:
     // serve.ts owns listen() so it can layer web/ over the same server and

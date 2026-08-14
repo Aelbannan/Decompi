@@ -147,13 +147,14 @@ test("basicMatchWorkflow compiles + registers + runs: accepts finalized, rejects
   assert.deepEqual(seenSelector?.sort, [{ by: "size", dir: "asc" }]);
   assert.equal(seenSelector?.limit, 100);
 
-  // Accepted items are finalized exactly once, with the default promote action.
+  // Accepted items are finalized exactly once, with the default action:
+  // promote + the compiled ladder's completionStatus (SPEC §A.4).
   assert.deepEqual(out.accepted.map((i) => i.id), ["f1"]);
   assert.deepEqual(
     finalized.map(([id]) => id),
     ["f1"],
   );
-  assert.deepEqual(finalized[0]![1], { promote: true });
+  assert.deepEqual(finalized[0]![1], { promote: true, status: "DONE" });
 
   // Rejected items were routed through the onReject fragment (a missing
   // fragment would throw) and, re-verified deterministically, stay rejected.

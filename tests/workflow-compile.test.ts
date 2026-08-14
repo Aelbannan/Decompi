@@ -18,8 +18,9 @@ import {
   applyScopeSelector,
   compileWorkflow,
   fragmentId,
+  resolveLadder,
 } from "../src/workflow/compile.js";
-import { WorkflowCompletionStore } from "../src/workflow/completions.js";
+import { WorkflowStatusStore } from "../src/workflow/status.js";
 import { Workflow } from "../src/workflow/types.js";
 
 const FLASH: ModelSpec = {
@@ -149,14 +150,14 @@ test("compileWorkflow: canBatch=false forces batch 1; absent defaultBatchSize de
 });
 
 // ---------------------------------------------------------------------------
-// plan: kind filter, def.select, scope, completion subtraction
+// plan: kind filter, def.select, scope, status (done) subtraction
 // ---------------------------------------------------------------------------
 
-test("plan: selects the workflow kind through def.select, applies scope, skips completed targets", async () => {
+test("plan: selects the workflow kind through def.select, applies scope, skips done targets", async () => {
   const db = new SqliteAdapter(":memory:");
   await db.migrate([]);
   try {
-    const completions = new WorkflowCompletionStore(db);
+    const statusesStore = new WorkflowStatusStore(db);
     const wf = new Workflow({
       id: "wf-plan",
       accepts: "function",
@@ -169,14 +170,15 @@ test("plan: selects the workflow kind through def.select, applies scope, skips c
       startPrompt: async () => "p",
       reprompt: async (targets) => ({ accepted: targets, rejected: [] }),
     });
-    const { pipeline } = compileWorkflow(wf, { completions });
+    const { pipeline } = compileWorkflow(wf, { statusesStore });
 
     const f1 = item("f1", { size: 50 });
     const f2 = item("f2", { size: 200 });
     const f3 = item("f3", { size: 300 });
     const o1 = { ...item("o1"), kind: "object" };
-    // f2 is already complete for this workflow: the plan must skip it.
-    await completions.complete({ workflowId: "wf-plan", targetId: "f2", actor: "test" });
+    // f2 is already done for this workflow (ladder default ["DONE"]): the
+    // plan must skip it.
+    await statusesStore.setStatus({ workflowId: "wf-plan", targetId: "f2", status: "DONE", actor: "test" });
 
     let seen: Selector | undefined;
     const ctx = {
@@ -199,7 +201,7 @@ test("plan: selects the workflow kind through def.select, applies scope, skips c
     assert.deepEqual(seen?.filter?.status, ["NOT_STARTED"]);
     assert.deepEqual(seen?.sort, [{ by: "size", dir: "asc" }]);
     assert.equal(seen?.limit, 100);
-    // Scope (targetIds ∩) removed f3; completion subtraction removed f2.
+    // Scope (targetIds ∩) removed f3; done-subtraction removed f2.
     assert.deepEqual(
       planned.map((i) => i.id),
       ["f1"],
@@ -209,7 +211,44 @@ test("plan: selects the workflow kind through def.select, applies scope, skips c
   }
 });
 
-test("plan: without a completions store nothing is pre-completed", async () => {
+test("plan: doneStatuses drives the subtraction (a non-last status stays selectable)", async () => {
+  const db = new SqliteAdapter(":memory:");
+  await db.migrate([]);
+  try {
+    const statusesStore = new WorkflowStatusStore(db);
+    const wf = new Workflow({
+      id: "wf-ladder",
+      accepts: "function",
+      statuses: ["NOT_STARTED", "CODE_MATCH", "FULL_MATCH"],
+      doneStatuses: ["FULL_MATCH"],
+      completionStatus: "FULL_MATCH",
+      startPrompt: async () => "p",
+      reprompt: async (targets) => ({ accepted: targets, rejected: [] }),
+    });
+    const { pipeline } = compileWorkflow(wf, { statusesStore });
+
+    const done = item("done", { size: 10 });
+    const partial = item("partial", { size: 20 });
+    const open = item("open", { size: 30 });
+    await statusesStore.setStatus({ workflowId: "wf-ladder", targetId: "done", status: "FULL_MATCH", actor: "run_1" });
+    await statusesStore.setStatus({ workflowId: "wf-ladder", targetId: "partial", status: "CODE_MATCH", actor: "run_1" });
+
+    const planned = await pipeline.plan({
+      select: async () => [done, partial, open],
+    } as unknown as StepCtx);
+
+    // FULL_MATCH is done (skipped); CODE_MATCH is on the ladder but NOT done
+    // (stays selectable — re-run may push it further).
+    assert.deepEqual(
+      planned.map((i) => i.id),
+      ["partial", "open"],
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("plan: without a status store nothing is pre-completed", async () => {
   const wf = new Workflow({
     id: "wf-noc",
     accepts: "function",
@@ -224,6 +263,63 @@ test("plan: without a completions store nothing is pre-completed", async () => {
     planned.map((i) => i.id),
     ["a", "b"],
   );
+});
+
+// ---------------------------------------------------------------------------
+// status ladder compilation (SPEC §A.1)
+// ---------------------------------------------------------------------------
+
+test("resolveLadder applies the defaults: [DONE] ladder, last-status done/completion", () => {
+  assert.deepEqual(resolveLadder({}), {
+    statuses: ["DONE"],
+    doneStatuses: ["DONE"],
+    completionStatus: "DONE",
+  });
+  assert.deepEqual(
+    resolveLadder({
+      statuses: ["NOT_STARTED", "CODE_MATCH", "FULL_MATCH"],
+      doneStatuses: ["CODE_MATCH", "FULL_MATCH"],
+      completionStatus: "FULL_MATCH",
+    }),
+    {
+      statuses: ["NOT_STARTED", "CODE_MATCH", "FULL_MATCH"],
+      doneStatuses: ["CODE_MATCH", "FULL_MATCH"],
+      completionStatus: "FULL_MATCH",
+    },
+  );
+  // doneStatuses/completionStatus default to the LAST ladder status.
+  assert.deepEqual(resolveLadder({ statuses: ["NEW", "DONE"] }), {
+    statuses: ["NEW", "DONE"],
+    doneStatuses: ["DONE"],
+    completionStatus: "DONE",
+  });
+});
+
+test("compileWorkflow compiles statuses/doneStatuses/completionStatus onto the pipeline", () => {
+  const wf = new Workflow({
+    id: "wf-ladder-compile",
+    accepts: "function",
+    statuses: ["NOT_STARTED", "CODE_MATCH", "FULL_MATCH"],
+    completionStatus: "FULL_MATCH",
+    startPrompt: async () => "p",
+    reprompt: async (targets) => ({ accepted: targets, rejected: [] }),
+  });
+  const { pipeline } = compileWorkflow(wf);
+  assert.deepEqual(pipeline.statuses, ["NOT_STARTED", "CODE_MATCH", "FULL_MATCH"]);
+  assert.deepEqual(pipeline.doneStatuses, ["FULL_MATCH"]); // defaults to the last status
+  assert.equal(pipeline.completionStatus, "FULL_MATCH");
+
+  // Defaults when the def declares none.
+  const plain = new Workflow({
+    id: "wf-ladder-default",
+    accepts: "function",
+    startPrompt: async () => "p",
+    reprompt: async (targets) => ({ accepted: targets, rejected: [] }),
+  });
+  const plainPipeline = compileWorkflow(plain).pipeline;
+  assert.deepEqual(plainPipeline.statuses, ["DONE"]);
+  assert.deepEqual(plainPipeline.doneStatuses, ["DONE"]);
+  assert.equal(plainPipeline.completionStatus, "DONE");
 });
 
 // ---------------------------------------------------------------------------

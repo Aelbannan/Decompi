@@ -7,7 +7,7 @@
  *
  * Compiled shape (SPEC §4 "Compilation map"):
  *
- *   accepts/select        → plan(): `{ kind: [K], ...select }` ∩ scope − isComplete(wf, ·)
+ *   accepts/select        → plan(): `{ kind: [K], ...select }` ∩ scope − isDone(wf, ·)
  *   canBatch/defaultBatch → foreach.batch
  *   startPrompt/reprompt  → agentLoop (the engine holds ONE session across turns)
  *   routes                → onReject → named fragments:
@@ -18,20 +18,22 @@
  * executes it. The workflow `def` is private on the class, so the compiler
  * reads it through the `Workflow.definition` getter.
  *
- * Scope/completion handles: the engine's `StepCtx` does not carry the run
- * scope or the completion store yet, so the plan reads `ctx.scope` through an
- * optional intersection type (absent = unscoped) and captures the completion
- * store at compile time (`CompileOptions.completions`; absent = nothing is
+ * Scope/status handles: the engine's `StepCtx` does not carry the run
+ * scope or the status store yet, so the plan reads `ctx.scope` through an
+ * optional intersection type (absent = unscoped) and captures the status
+ * store at compile time (`CompileOptions.statusesStore`; absent = nothing is
  * pre-completed, mirroring the "stub until the daemon wires it" pattern in
  * `helpers.ts`).
  */
 import type { AgentTurn } from "../pipeline/engine.js";
 import type { Pipeline, Route, Step, StepCtx } from "../pipeline/types.js";
 import type { Selector, WorkItem } from "../types.js";
-import type { WorkflowCompletionStore } from "./completions.js";
+import type { WorkflowStatusStore } from "./status.js";
 import { makeBuiltinHelpers, makeStartJsonAgent } from "./helpers.js";
 import type { HelperRegistry, ReadonlyStore, WorkflowHelpers } from "./helpers.js";
+import { isReservedToolName } from "./types.js";
 import type {
+  CompletionAction,
   RunScope,
   Workflow,
   WorkflowConfig,
@@ -44,15 +46,38 @@ import type {
 /** Default `foreach.batch` when `defaultBatchSize` is absent (SPEC §2: default 5). */
 export const DEFAULT_BATCH_SIZE = 5;
 
+/** The status ladder defaults (SPEC §A.1). */
+export const DEFAULT_STATUSES = ["DONE"] as const;
+
+/**
+ * Resolve a workflow's status ladder with its defaults (SPEC §A.1):
+ * `statuses` defaults to `["DONE"]`; `doneStatuses` defaults to the LAST
+ * status; `completionStatus` defaults to the LAST status. The resolved
+ * triple is compiled onto the pipeline so the engine can read it.
+ */
+export function resolveLadder(def: {
+  statuses?: string[];
+  doneStatuses?: string[];
+  completionStatus?: string;
+}): { statuses: string[]; doneStatuses: string[]; completionStatus: string } {
+  const statuses = def.statuses ?? [...DEFAULT_STATUSES];
+  const last = statuses[statuses.length - 1] ?? "DONE";
+  return {
+    statuses,
+    doneStatuses: def.doneStatuses ?? [last],
+    completionStatus: def.completionStatus ?? last,
+  };
+}
+
 /** Options for {@link compileWorkflow}. */
 export interface CompileOptions {
   /**
-   * Workflow completion store (SPEC §5): the compiled plan subtracts
-   * completed targets (`isComplete(wf, ·)`). Absent = nothing is
+   * Workflow status store (SPEC §A.3): the compiled plan subtracts done
+   * targets (`isDone(wf, ·, doneStatuses)`). Absent = nothing is
    * pre-completed; the daemon path wires the store later (a workflow stays
    * fully selectable until then).
    */
-  completions?: WorkflowCompletionStore;
+  statusesStore?: WorkflowStatusStore;
   /**
    * Adapter-wide helper registry (SPEC §3): compiled ONTO the pipeline as
    * its run default — the engine materializes it into `ctx.helpers` (via
@@ -202,15 +227,38 @@ function adaptSetup<K extends WorkItemKind, H extends Record<string, unknown>>(
     def.setup!(targets as WorkItemOf<K>[], forwardCtx<K, H>(ctx, def));
 }
 
+/**
+ * Adapt `def.complete` to the engine's `agentLoop.complete` surface
+ * (SPEC §2/§5.2): the decider returns what "complete" means for ONE target;
+ * the engine executes it via `ctx.finalize` with the returned
+ * `CompletionAction`. Absent when the workflow declares no `complete` — the
+ * engine then defaults to `{ promote: true, status: completionStatus }`.
+ */
+function adaptComplete<K extends WorkItemKind, H extends Record<string, unknown>>(
+  def: WorkflowDef<K, H>,
+): (target: WorkItem, ctx: StepCtx) => Promise<CompletionAction> {
+  return async (target, ctx) =>
+    def.complete!(
+      target as WorkItemOf<K>,
+      forwardCtx<K, H>(ctx, def, ctx.lastAgentResult),
+    );
+}
+
 /** Build the `agentLoop` step shared by the main foreach and the fragments. */
 function agentLoopStep<K extends WorkItemKind, H extends Record<string, unknown>>(
   def: WorkflowDef<K, H>,
+  completionStatus: string,
 ): Step {
   return {
     kind: "agentLoop",
     start: adaptStart(def),
     reprompt: adaptReprompt(def),
     ...(def.rejectionRetries !== undefined ? { rejectionRetries: def.rejectionRetries } : {}),
+    ...(def.complete !== undefined ? { complete: adaptComplete(def) } : {}),
+    ...(def.customTools !== undefined && def.customTools.length > 0
+      ? { customTools: def.customTools }
+      : {}),
+    ...(completionStatus !== undefined ? { completionStatus } : {}),
   };
 }
 
@@ -224,11 +272,25 @@ export function compileWorkflow<K extends WorkItemKind, H extends Record<string,
   opts?: CompileOptions,
 ): CompiledWorkflow {
   const def = w.definition;
+  // Status ladder (SPEC §A.1): resolved once here, compiled onto the
+  // pipeline (engine-readable) and used by the plan's done-subtraction.
+  const ladder = resolveLadder(def);
+  // Reserved core tool names (SPEC §B.1): a workflow custom tool shadowing a
+  // core built-in (`finish`/`select`/`status`/`lint`) is a compile-time error
+  // — the core toolset cannot be shadowed.
+  for (const tool of def.customTools ?? []) {
+    if (isReservedToolName(tool.name)) {
+      throw new Error(
+        `workflow "${w.id}": custom tool "${tool.name}" is core-reserved ` +
+          `(finish/select/status/lint) — rename the tool`,
+      );
+    }
+  }
   // canBatch: false = one target per session (batch 1); default batch = 5.
   const batch = def.canBatch === false ? 1 : (def.defaultBatchSize ?? DEFAULT_BATCH_SIZE);
   // One shared descriptor: the engine reads steps immutably, so the main
   // foreach and every route fragment can reuse the same agentLoop.
-  const loop = agentLoopStep(def);
+  const loop = agentLoopStep(def, ladder.completionStatus);
 
   // Plan selector: kind is ALWAYS = accepts; def.select narrows it further
   // (status/sort/limit; ids are excluded from def.select — scope owns them).
@@ -271,14 +333,24 @@ export function compileWorkflow<K extends WorkItemKind, H extends Record<string,
   const pipeline: Pipeline = {
     id: w.id,
     adapter: "workflow",
+    // The status ladder, compiled so the engine can read it (the engine's
+    // default finalize writes `completionStatus`; plans/verifiers can use
+    // `doneStatuses`/`statuses`).
+    statuses: ladder.statuses,
+    doneStatuses: ladder.doneStatuses,
+    completionStatus: ladder.completionStatus,
     ...(opts?.helpers !== undefined ? { helpers: opts.helpers } : {}),
     plan: async (ctx: PlanCtx) => {
       const items = await ctx.select(selector);
       const scoped = applyScopeSelector(items, ctx.scope);
-      if (opts?.completions === undefined) return scoped;
+      if (opts?.statusesStore === undefined) return scoped;
       const open: WorkItem[] = [];
       for (const item of scoped) {
-        if (!(await opts.completions.isComplete(w.id, item))) open.push(item);
+        // SPEC §A.3: subtract targets whose RESOLVED status is done — never
+        // a raw OR over scopes (target-within-unit > target > unit).
+        if (!(await opts.statusesStore.isDone(w.id, item, ladder.doneStatuses))) {
+          open.push(item);
+        }
       }
       return open;
     },

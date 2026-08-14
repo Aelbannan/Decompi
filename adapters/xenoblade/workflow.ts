@@ -41,9 +41,15 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { z } from "zod";
+import type { AdapterCtx } from "../../src/adapter/types.js";
 import type { WorkItem } from "../../src/types.js";
 import type { HelperRegistry } from "../../src/workflow/helpers.js";
-import { resolveXenobladePython, resolveXenobladeRoot } from "./adapter.js";
+import type { Tool } from "../../src/workflow/types.js";
+import xenobladeAdapter, {
+  resolveXenobladePython,
+  resolveXenobladeRoot,
+} from "./adapter.js";
 
 /** A xenoblade function work item: a `function`-kind target with asm text. */
 export type FunctionWorkItem = WorkItem & { kind: "function"; asmText: string };
@@ -307,4 +313,79 @@ export function registerHelpers(registry: HelperRegistry): void {
   registry.register("getFunctionAsm", getFunctionAsm);
   registry.register("runBatchCycle", runBatchCycle);
   registry.register("structLayout", structLayout);
+}
+
+// ── Agent tools (SPEC §B.1 adapter tools) ─────────────────────────────────
+
+/**
+ * A minimal WorkItem for the tool paths that need one (hexdiff/asm only
+ * read `unitId` + `symbol`; the rest is the adapter-import baseline).
+ */
+function toolItem(unit: string, symbol: string): WorkItem {
+  return {
+    id: `${unit}:${symbol}`,
+    kind: "function",
+    unitId: unit,
+    symbol,
+    lifecycle: "pending",
+    status: "NOT_STARTED",
+    attempts: 0,
+    exhausted: false,
+    ready: true,
+    meta: {},
+  };
+}
+
+/**
+ * The xenoblade adapter tools (SPEC §B.1): thin Tool wrappers over the real
+ * helpers — `hexdiff` (adapter.diff), `asm` (getFunctionAsm), plus the
+ * `size`/`symbols` stubs (not implemented yet). Workflow/daemon integration
+ * passes the array to the engine, which assembles it into the session
+ * toolset next to the core built-ins. AdapterCtx is not threaded yet — the
+ * diff path only reads the item, so a placeholder ctx is passed through.
+ */
+export function registerTools(): Tool[] {
+  return [
+    {
+      name: "hexdiff",
+      description:
+        "Diff one function's decompiled output against the retail object " +
+        "(`hexdiff.py <unit> --symbol <symbol>`): returns the instruction " +
+        "diff (mismatch count, structural/reg-swap breakdown, sizes).",
+      inputSchema: z.object({ unit: z.string(), symbol: z.string() }),
+      run: async (_ctx, args: { unit: string; symbol: string }) =>
+        xenobladeAdapter.diff({} as AdapterCtx, toolItem(args.unit, args.symbol)),
+    },
+    {
+      name: "asm",
+      description:
+        "Fetch the retail assembly text for one function " +
+        "(`hexdiff.py <unit> --symbol <symbol> --asm --no-build`).",
+      inputSchema: z.object({ unit: z.string(), symbol: z.string() }),
+      run: async (_ctx, args: { unit: string; symbol: string }) =>
+        getFunctionAsm({
+          ...toolItem(args.unit, args.symbol),
+          kind: "function",
+          asmText: "",
+        } as FunctionWorkItem),
+    },
+    {
+      name: "size",
+      description:
+        "Function size lookup — not implemented yet (stub); throws until the " +
+        "helper lands.",
+      inputSchema: z.object({ unit: z.string(), symbol: z.string() }),
+      run: async () => {
+        throw new Error("size tool: not implemented yet (stub)");
+      },
+    },
+    {
+      name: "symbols",
+      description:
+        "Symbol-table lookup — not implemented yet (stub); returns an empty " +
+        "list until the helper lands.",
+      inputSchema: z.object({ unit: z.string() }),
+      run: async () => [],
+    },
+  ];
 }

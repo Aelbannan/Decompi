@@ -50,7 +50,7 @@ export interface RepromptVerdict<K extends WorkItemKind = WorkItemKind> {
  * (decider) returns this; the engine executes it via `ctx.finalize` (writer).
  */
 export type CompletionAction =
-  | { promote: false }
+  | { promote: false; status?: string }
   | { promote: true; status?: string; evidence?: unknown }
   | { status: string };
 
@@ -102,6 +102,14 @@ export interface WorkflowDef<
   helpers?: H;
 
   /**
+   * Workflow agent tools (SPEC §B.1): compiled onto the `agentLoop` step and
+   * assembled into the session toolset next to the core built-ins (workflow
+   * > adapter > core precedence, EXCEPT the core-reserved names
+   * `RESERVED_CORE_TOOLS`, which a workflow tool may not shadow).
+   */
+  customTools?: Tool[];
+
+  /**
    * Per-batch config hook (SPEC §A.1): the engine runs it ONCE per batch,
    * before the `agentLoop`. Returns a `WorkflowConfig` (batch sub-division /
    * model / rejectionRetries overrides); the engine consumes it — this field
@@ -129,6 +137,27 @@ export interface WorkflowDef<
   ): Promise<RepromptVerdict<K>>;
   /** Decider: returns what "complete" means; the engine executes via `ctx.finalize`. */
   complete?(target: WorkItemOf<K>, ctx: WorkflowCtx<K, H>): Promise<CompletionAction>;
+
+  // ── Status ladder (SPEC §A.1) ──────────────────────────────────────────
+  /** The workflow's own status ladder. Default: ["DONE"]. */
+  statuses?: string[];
+  /** Which statuses count as "done" (plan skips). Default: [last status]. */
+  doneStatuses?: string[];
+  /** Status written by run-time acceptance finalize. Default: last status. */
+  completionStatus?: string;
+}
+
+/**
+ * Core-reserved tool names (SPEC §B.1): `finish` is the engine-owned
+ * built-in (SPEC §B.4); `select`/`status`/`lint` are reserved for future
+ * core built-ins. A workflow or adapter tool declaring one of these names
+ * is rejected at compile time — the core toolset cannot be shadowed.
+ */
+export const RESERVED_CORE_TOOLS = ["finish", "select", "status", "lint"] as const;
+
+/** True when `name` is a core-reserved tool name (SPEC §B.1). */
+export function isReservedToolName(name: string): boolean {
+  return (RESERVED_CORE_TOOLS as readonly string[]).includes(name);
 }
 
 /**
@@ -222,4 +251,25 @@ export class Workflow<
   compile(): Pipeline {
     return compileWorkflow(this).pipeline;
   }
+}
+
+/**
+ * A typed agent tool (SPEC §B.2): a zod-typed input schema plus a handler
+ * run by the harness when the model calls the tool. `inputSchema` converts
+ * to a JSON schema for the SDK; `run(ctx, args)` executes the call and its
+ * return value is fed back to the model (a throw surfaces as a tool-error
+ * result). The session toolset = core built-ins + adapter tools + workflow
+ * tools, merged with workflow > adapter > core precedence except the
+ * core-reserved names (`RESERVED_CORE_TOOLS`), which may not be shadowed.
+ */
+export interface Tool<S extends z.ZodType = z.ZodType> {
+  name: string;
+  description: string;
+  /** zod input schema → JSON schema for the SDK; `args` = `z.infer<S>`. */
+  inputSchema: S;
+  /** Execute one tool call; the result is fed back to the model. */
+  run(
+    ctx: WorkflowCtx<WorkItemKind, Record<string, unknown>>,
+    args: z.infer<S>,
+  ): Promise<unknown>;
 }

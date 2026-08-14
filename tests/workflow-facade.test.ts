@@ -17,7 +17,7 @@ import { PipelineEngine } from "../src/pipeline/engine.js";
 import { RunScheduler, type RunSpec } from "../src/server/scheduler.js";
 import { WorkItemRepo } from "../src/target/work-item.js";
 import type { ModelSpec, WorkItem } from "../src/types.js";
-import { WorkflowCompletionStore } from "../src/workflow/completions.js";
+import { WorkflowStatusStore } from "../src/workflow/status.js";
 import { Decompi } from "../src/workflow/facade.js";
 import { Workflow } from "../src/workflow/types.js";
 
@@ -207,7 +207,7 @@ test("facade run through the real RunScheduler completes (plan + agentLoop over 
     Decompi.configure({
       engine,
       scheduler,
-      completions: new WorkflowCompletionStore(db),
+      statusesStore: new WorkflowStatusStore(db),
     });
 
     const wf = new Workflow({

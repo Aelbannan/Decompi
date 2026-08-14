@@ -54,11 +54,16 @@
  *   POST /api/runs/:id/cancel   → { run } | 404   (audit run-cancel)
  *   GET  /api/work-items?selector=<json> → { workItems: WorkItem[] } (selector.ts select)
  *   GET  /api/events?runId=&after=&limit= → { events: EventRow[] }
- *   POST /api/workflows/:id/completions  → 201 { workflowId, unitId?, targetId?, completed }
- *                                  (body: { targetId?, unitId?, reason? }; auth + audit,
- *                                   delegating to the WorkflowCompletionStore — SPEC §5.4)
- *   DELETE /api/workflows/:id/completions → 200 { workflowId, unitId?, targetId?, removed }
+ *   GET  /api/workflows/:id/status?unit=&target= → { workflowId, rows: WorkflowStatusRow[] }
+ *                                  (auth + audit; the status rows for the workflow,
+ *                                   optionally filtered by unit/target)
+ *   POST /api/workflows/:id/status  → 200 { workflowId, unitId?, targetId?, status }
+ *                                  (body: { targetId?, unitId?, status, reason? };
+ *                                   auth + audit; UPSERT on the UNIQUE
+ *                                   (workflow, unit, target) key — SPEC §A.2/A.4)
+ *   DELETE /api/workflows/:id/status → 200 { workflowId, unitId?, targetId?, removed }
  *                                  (body: { targetId?, unitId? }; auth + audit;
+ *                                   resets/clears the matching status rows;
  *                                   neither given = clear ALL rows for the workflow)
  *   POST /api/analyze              → 200 { result }  (body: { prompt, runId?, model? };
  *                                  introspection agent, prompt bounded, audited)
@@ -89,7 +94,7 @@ import {
   runAnalysis,
 } from "./analyze.js";
 import type { RunRecord, RunScheduler, RunSpec } from "./scheduler.js";
-import { WorkflowCompletionStore } from "../workflow/completions.js";
+import { WorkflowStatusStore } from "../workflow/status.js";
 
 export type { RunRecord, RunSpec } from "./scheduler.js";
 
@@ -267,11 +272,11 @@ export interface ApiServerOptions {
   /** Max request body bytes; defaults to 1 MiB. */
   maxBodyBytes?: number;
   /**
-   * Workflow completion store for `POST`/`DELETE
-   * /api/workflows/:id/completions` (SPEC §5.4). Defaults to one over
-   * `store` — serve/tests only inject a custom instance to double the writer.
+   * Workflow status store for `/api/workflows/:id/status` (SPEC §A.2/A.4).
+   * Defaults to one over `store` — serve/tests only inject a custom
+   * instance to double the writer.
    */
-  completions?: WorkflowCompletionStore;
+  statusesStore?: WorkflowStatusStore;
   /** Agent runtime for `POST /api/analyze` (SPEC §17). Defaults to a
    * deterministic `MockAgentRuntime` with {@link DEFAULT_ANALYZE_MODEL}
    * registered.
@@ -789,11 +794,11 @@ class ControlPlane {
   private get authTokens(): AuthTokenProvider {
     return this.opts.authTokens;
   }
-  /** Workflow completion store (SPEC §5.4); defaults to one over the store. */
-  private completionStore: WorkflowCompletionStore | null = null;
-  private get completions(): WorkflowCompletionStore {
-    this.completionStore ??= this.opts.completions ?? new WorkflowCompletionStore(this.store);
-    return this.completionStore;
+  /** Workflow status store (SPEC §A); defaults to one over the store. */
+  private statusStore: WorkflowStatusStore | null = null;
+  private get statuses(): WorkflowStatusStore {
+    this.statusStore ??= this.opts.statusesStore ?? new WorkflowStatusStore(this.store);
+    return this.statusStore;
   }
   private get pollIntervalMs(): number {
     return this.opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
@@ -891,14 +896,18 @@ class ControlPlane {
       await this.handleAnalyze(req, res, identity);
       return;
     }
-    const workflowMatch = /^\/api\/workflows\/([^/]+)\/completions$/.exec(path);
+    const workflowMatch = /^\/api\/workflows\/([^/]+)\/status$/.exec(path);
     if (workflowMatch !== null) {
+      if (method === "GET") {
+        await this.handleGetWorkflowStatus(req, res, identity, workflowMatch[1]!);
+        return;
+      }
       if (method === "POST") {
-        await this.handleCompleteWorkflow(req, res, identity, workflowMatch[1]!);
+        await this.handleSetWorkflowStatus(req, res, identity, workflowMatch[1]!);
         return;
       }
       if (method === "DELETE") {
-        await this.handleUncompleteWorkflow(req, res, identity, workflowMatch[1]!);
+        await this.handleResetWorkflowStatus(req, res, identity, workflowMatch[1]!);
         return;
       }
       throw new ApiError(404, "not found");
@@ -1116,11 +1125,11 @@ class ControlPlane {
   }
 
   /**
-   * Parse the shared `{ targetId?, unitId? }` body shape of the completions
-   * endpoints (SPEC §5.4). `requireOne` enforces the complete contract (at
-   * least one id); uncomplete allows neither (clear-all, store semantics).
+   * Parse the shared `{ targetId?, unitId? }` body shape of the status
+   * endpoints (SPEC §A). `requireOne` enforces the set contract (at least
+   * one id); reset allows neither (clear-all, store semantics).
    */
-  private parseCompletionScope(
+  private parseStatusScope(
     body: unknown,
     requireOne: boolean,
   ): { targetId?: string; unitId?: string } {
@@ -1155,25 +1164,62 @@ class ControlPlane {
   }
 
   /**
-   * POST /api/workflows/:id/completions (SPEC §5.4): insert-or-ignore a
-   * completion row through the store (auth + audit). `{ promote:false }`-style
-   * manual completion: the row alone marks the scope complete; no work_items
-   * write (the daemon's `finalizeWorkflowItem` is the run-time writer).
+   * GET /api/workflows/:id/status (SPEC §A): the workflow's status rows,
+   * optionally filtered by `?unit=` / `?target=` (auth + audit).
    */
-  private async handleCompleteWorkflow(
+  private async handleGetWorkflowStatus(
+    req: IncomingMessage,
+    res: ServerResponse,
+    identity: TokenIdentity,
+    workflowId: string,
+  ): Promise<void> {
+    const params = new URL(req.url ?? "/", "http://localhost").searchParams;
+    const unit = params.get("unit") ?? undefined;
+    const target = params.get("target") ?? undefined;
+    if (unit !== undefined && unit.length === 0) {
+      throw new ApiError(400, "'unit' must be a non-empty string");
+    }
+    if (target !== undefined && target.length === 0) {
+      throw new ApiError(400, "'target' must be a non-empty string");
+    }
+    const rows = await this.statuses.list(workflowId);
+    const filtered = rows.filter(
+      (row) => (unit === undefined || row.unitId === unit) && (target === undefined || row.targetId === target),
+    );
+    await this.writeAudit({
+      actor: identity.id,
+      action: "workflow-status-read",
+      costMicroUsd: null,
+      data: { workflowId, unit, target },
+    });
+    sendJson(res, 200, { workflowId, rows: filtered });
+  }
+
+  /**
+   * POST /api/workflows/:id/status (SPEC §A.2/A.4): UPSERT one status row on
+   * the UNIQUE (workflow, unit, target) key — re-setting a scope replaces
+   * its status (auth + audit). Body: `{ targetId?, unitId?, status,
+   * reason? }`; at least one id required.
+   */
+  private async handleSetWorkflowStatus(
     req: IncomingMessage,
     res: ServerResponse,
     identity: TokenIdentity,
     workflowId: string,
   ): Promise<void> {
     const parsed = await this.readJsonBody(req);
-    const { targetId, unitId } = this.parseCompletionScope(parsed, true);
+    const { targetId, unitId } = this.parseStatusScope(parsed, true);
+    const status = (parsed as Record<string, unknown>).status;
+    if (typeof status !== "string" || status.length === 0) {
+      throw new ApiError(400, "'status' must be a non-empty string");
+    }
     const reason = (parsed as Record<string, unknown>).reason;
     if (reason !== undefined && typeof reason !== "string") {
       throw new ApiError(400, "'reason' must be a string");
     }
-    const inserted = await this.completions.complete({
+    await this.statuses.setStatus({
       workflowId,
+      status,
       actor: identity.id,
       ...(targetId !== undefined ? { targetId } : {}),
       ...(unitId !== undefined ? { unitId } : {}),
@@ -1181,34 +1227,34 @@ class ControlPlane {
     });
     await this.writeAudit({
       actor: identity.id,
-      action: "workflow-complete",
+      action: "workflow-status-set",
       costMicroUsd: null,
-      data: { workflowId, unitId, targetId, reason },
+      data: { workflowId, unitId, targetId, status, reason },
     });
-    sendJson(res, 201, { workflowId, unitId, targetId, completed: inserted });
+    sendJson(res, 200, { workflowId, unitId, targetId, status });
   }
 
   /**
-   * DELETE /api/workflows/:id/completions (SPEC §5.4): remove matching rows
-   * (target-scoped deletes the precise run-time row too). Neither id given =
-   * clear ALL completion rows for the workflow. Auth + audit.
+   * DELETE /api/workflows/:id/status (SPEC §A): reset/clear matching status
+   * rows (target-scoped deletes the precise run-time row too); neither id
+   * given = clear ALL status rows for the workflow. Auth + audit.
    */
-  private async handleUncompleteWorkflow(
+  private async handleResetWorkflowStatus(
     req: IncomingMessage,
     res: ServerResponse,
     identity: TokenIdentity,
     workflowId: string,
   ): Promise<void> {
     const parsed = await this.readJsonBody(req);
-    const { targetId, unitId } = this.parseCompletionScope(parsed, false);
-    const removed = await this.completions.uncomplete({
+    const { targetId, unitId } = this.parseStatusScope(parsed, false);
+    const removed = await this.statuses.unsetStatus({
       workflowId,
       ...(targetId !== undefined ? { targetId } : {}),
       ...(unitId !== undefined ? { unitId } : {}),
     });
     await this.writeAudit({
       actor: identity.id,
-      action: "workflow-uncomplete",
+      action: "workflow-status-reset",
       costMicroUsd: null,
       data: { workflowId, unitId, targetId },
     });

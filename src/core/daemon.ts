@@ -39,7 +39,7 @@ import {
   type EmitEvent,
   type EventRow,
 } from "./events.js";
-import { WorkflowCompletionStore } from "../workflow/completions.js";
+import { WorkflowStatusStore } from "../workflow/status.js";
 import type { CompletionAction } from "../workflow/types.js";
 import {
   exportRegistry,
@@ -55,16 +55,20 @@ export type ClaimArgs = Omit<ClaimRequest, "epoch">;
 export type EmitArgs = EmitEvent;
 
 /**
- * Finalize input for the daemon (SPEC §5.3): the workflow, the target, the
- * actor, and the decider's `CompletionAction` (what "complete" means for
- * this target). The daemon is the ONLY writer for this transition — hooks
- * never reach `execute`/`transaction` directly.
+ * Finalize input for the daemon (SPEC §A.4): the workflow, the target, the
+ * actor, the decider's `CompletionAction` (what "complete" means for this
+ * target), and the workflow's `completionStatus` (the status written when
+ * the action carries none — compiled from `WorkflowDef.completionStatus`,
+ * defaulting to the ladder's last status). The daemon is the ONLY writer
+ * for this transition — hooks never reach `execute`/`transaction` directly.
  */
 export interface FinalizeWorkflowItemInput {
   workflowId: string;
   target: WorkItem;
   actor: string;
   action: CompletionAction;
+  /** Default status when `action.status` is absent; defaults to "DONE". */
+  completionStatus?: string;
 }
 
 export interface StoreDaemonOptions {
@@ -177,25 +181,24 @@ export class StoreDaemon {
   }
 
   /**
-   * Finalize one workflow item (SPEC §5.3): the single writer for run-time
-   * workflow completion. ONE transaction writes, in order:
+   * Finalize one workflow item (SPEC §A.4): the single writer for run-time
+   * workflow status. ONE transaction writes, in order:
    *
-   *   1. the precise completion row `(wf, unit-of-target, target)` —
-   *      insert-or-ignore, so a racing manual complete (or a re-finalize of
-   *      a stable accepted item) never double-writes;
+   *   1. the precise status row `(wf, unit-of-target, target)` — an UPSERT
+   *      on the UNIQUE key (SPEC §A.2), with status = `action.status ??
+   *      input.completionStatus ?? "DONE"`; re-finalizing a target REPLACES
+   *      its status rather than stacking a row;
    *   2. the `CompletionAction` write on `work_items`: `promote:true` sets
    *      `lifecycle='accepted'` and `status` (COALESCE keeps the current
    *      status when none is given); `{status}` alone sets only status;
    *      `promote:false` with no status skips the work_items write entirely;
-   *   3. a `target-accepted` event row, appended in the SAME transaction via
+   *   3. a `target-status` event row, appended in the SAME transaction via
    *      the events counter (the same seq source `EventStore.emit` uses, so
-   *      seqs stay gap-free even alongside micro-batched emits). The row,
-   *      the item write, and the event commit or roll back together.
-   *
-   * Idempotent: when the completion row already exists (the insert is
-   * ignored — detected via the insert's `changes`), the lifecycle/status
-   * write still runs when the action asks for it, but NO duplicate event is
-   * emitted.
+   *      seqs stay gap-free even alongside micro-batched emits), emitted
+   *      ONLY on a status CHANGE — the old status is resolved before the
+   *      upsert and compared to the new one; a same-status re-finalize
+   *      writes the row but never a duplicate event. The row, the item
+   *      write, and the event commit or roll back together.
    */
   finalizeWorkflowItem(input: FinalizeWorkflowItemInput): Promise<void> {
     if (this.closed) return this.closedError();
@@ -204,37 +207,46 @@ export class StoreDaemon {
         const ts = new Date().toISOString();
         const { workflowId, target, actor, action } = input;
         const unitId = target.unitId ?? "";
+        const actionStatus = "status" in action ? action.status : undefined;
+        // Default status: the action's status, else the workflow's
+        // completionStatus (threaded from the compiled def), else "DONE"
+        // (the ladder default, SPEC §A.1).
+        const status = actionStatus ?? input.completionStatus ?? "DONE";
 
-        // 1. Completion row, precise form (SPEC §5.1). `inserted` is false
-        //    when the exact (wf, unit, target) row already exists.
-        const completions = new WorkflowCompletionStore(tx);
-        const inserted = await completions.complete({
+        // 1. Precise status row (SPEC §A.2), resolved BEFORE the upsert so
+        //    the event below knows whether the status actually changed.
+        const statuses = new WorkflowStatusStore(tx);
+        const previous = await statuses.resolveStatus(workflowId, {
+          id: target.id,
+          unitId,
+        });
+        await statuses.setStatus({
           workflowId,
           unitId,
           targetId: target.id,
+          status,
           actor,
           reason: "run-time",
         });
 
-        // 2. The CompletionAction write (SPEC §5.3).
+        // 2. The CompletionAction write (SPEC §A.4).
         const promote = "promote" in action && action.promote === true;
-        const status = "status" in action ? action.status : undefined;
         if (promote) {
           await tx.execute(
             "UPDATE work_items SET lifecycle = 'accepted', status = COALESCE(?, status), updated_at = ? WHERE id = ?",
-            [status ?? null, ts, target.id],
+            [actionStatus ?? null, ts, target.id],
           );
-        } else if (status !== undefined) {
+        } else if (actionStatus !== undefined) {
           await tx.execute(
             "UPDATE work_items SET status = ?, updated_at = ? WHERE id = ?",
-            [status, ts, target.id],
+            [actionStatus, ts, target.id],
           );
         }
         // { promote: false } without a status: no work_items write at all.
 
-        // 3. `target-accepted` event, same transaction, only when THIS call
-        //    recorded the completion (a re-finalize never duplicates it).
-        if (inserted && promote) {
+        // 3. `target-status` event, same transaction, ONLY on a status
+        //    change (from → to); a same-status re-finalize never emits.
+        if (previous !== status) {
           // Seq from the events counter — the same source EventStore.emit
           // drains, so seqs stay gap-free across both write paths.
           await tx.insertIgnore(
@@ -257,9 +269,10 @@ export class StoreDaemon {
           const payload: Record<string, unknown> = {
             workflowId,
             actor,
-            completedAt: ts,
+            from: previous ?? null,
+            updatedAt: ts,
+            status,
           };
-          if (status !== undefined) payload.status = status;
           if ("evidence" in action && action.evidence !== undefined) {
             payload.evidence = action.evidence;
           }
@@ -267,7 +280,7 @@ export class StoreDaemon {
           // payload (e.g. a circular `evidence`) aborts and rolls back the
           // row + item write with it — atomic, never a half-finalize.
           await tx.execute(
-            "INSERT INTO events (seq, ts, run_id, work_item_id, type, level, data) VALUES (?, ?, NULL, ?, 'target-accepted', 'info', ?)",
+            "INSERT INTO events (seq, ts, run_id, work_item_id, type, level, data) VALUES (?, ?, NULL, ?, 'target-status', 'info', ?)",
             [Number(next), ts, target.id, JSON.stringify(payload)],
           );
         }
