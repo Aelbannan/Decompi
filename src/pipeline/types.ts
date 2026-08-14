@@ -142,6 +142,13 @@ export interface Pipeline {
   steps: Step[];
   /** Event triggers evaluated after a run (SPEC §10). */
   triggers?: Trigger[];
+  /**
+   * Adapter-wide helper registry compiled onto the pipeline by the workflow
+   * compiler (SPEC §3): the engine materializes it into `ctx.helpers` when
+   * the run context supplies none (a run-specific `RunContext.helpers`
+   * wins).
+   */
+  helpers?: HelperRegistry;
 }
 
 /** Result of running a step (or a `StepCtx.run` sub-step). */

@@ -26,6 +26,8 @@ import type { ModelCost, Selector, WorkItem } from "../types.js";
 import { BudgetExceededError, BudgetTracker, sessionCostMicroUsd } from "../agent/budget.js";
 import type { RateLimiter } from "../agent/ratelimit.js";
 import { PipelineEngine, type RunContext, type RunOutcome } from "./engine.js";
+import type { WorkflowCompletionStore } from "../workflow/completions.js";
+import type { HelperRegistry } from "../workflow/helpers.js";
 
 export { BudgetExceededError } from "../agent/budget.js";
 
@@ -67,6 +69,19 @@ export interface RunOptions {
   select?: RunContext["select"];
   /** Passed through to the engine's RunContext. */
   log?: RunContext["log"];
+  /**
+   * Workflow completion store (SPEC §5): passed through to the engine's
+   * RunContext — when the run supplies no `finalize`, accepted
+   * `{ promote: true }` items record precise completion rows through it, so
+   * a later plan skips them.
+   */
+  completions?: WorkflowCompletionStore;
+  /**
+   * Adapter-wide helper registry (SPEC §3): passed through to the engine's
+   * RunContext so `forwardCtx` materializes `ctx.helpers` for workflow
+   * hooks.
+   */
+  helpers?: HelperRegistry;
   /**
    * Called once when the run settles with the ACTUAL metered cost (micro-USD
    * charged from `SessionUsage` × model price). The caller records it in the
@@ -114,6 +129,8 @@ export function runPipelineWithBudget(
     ...(select !== undefined ? { select } : {}),
     ...(opts.log !== undefined ? { log: opts.log } : {}),
     ...(opts.styleGuidePath !== undefined ? { styleGuidePath: opts.styleGuidePath } : {}),
+    ...(opts.completions !== undefined ? { completions: opts.completions } : {}),
+    ...(opts.helpers !== undefined ? { helpers: opts.helpers } : {}),
   };
   return engine.runPipeline(pipelineId, ctx0).finally(() => {
     // Report the ACTUAL metered cost once the run settles (also on error —

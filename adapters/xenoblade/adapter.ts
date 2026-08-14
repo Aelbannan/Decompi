@@ -37,8 +37,15 @@
  * around build-performing RPCs (`buildUnit`, and `diff` once it can build)
  * by the M3/M4 daemon, per §7.1 — the adapter only exposes the lock path.
  *
- * Not implemented in M2.5: `importWorkItems` (the targets.json migration is
- * the M2 milestone — loud stub), and the optional members
+ * `importWorkItems` (SPEC §6.4) is implemented as a LIVE READ, not a
+ * migration: it parses `<root>/tools/coop/targets.json` — cached
+ * module-level, keyed by file mtime/size, so repeated imports never re-parse
+ * the 18 MB registry — and maps each target per the §6.4 field map
+ * (workflow_status → lifecycle; hex size → number; every un-mapped field,
+ * e.g. instruction_match / called_functions / depends_on / capabilities,
+ * rides JSON-serialized in `meta`). Materialized columns stay at their
+ * defaults (attempts=0, exhausted=false, ready=false) — the store computes
+ * them on insert. The optional members
  * `scanSource`/`syncCalls`/`syncSymbols`/`buildUnit`/`unitReport`/
  * `witnessEngine`/`symbolTable`/`retailAsmIndex`/`relocMap` (coop tooling,
  * objdiff report, z3 witness, and the asm/symbol data sources land with
@@ -46,7 +53,7 @@
  * values — the §13 rule registry is core-side (src/parse/cpp) and no style
  * guide ships with M2.5.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WorkerPool, WorkerRpcError, type WorkerSpec } from "../../src/core/worker.js";
@@ -64,6 +71,155 @@ import type { WorkItem, Verdict } from "../../src/types.js";
 const DIFF_TIMEOUT_MS = 600_000;
 /** One long-lived diff worker process (diff is single-symbol, build-free). */
 const DIFF_POOL_SIZE = 1;
+
+// ── targets.json import (SPEC §6.4 live read) ──────────────────────────────
+
+/**
+ * SPEC §6.4 field map: targets.json keys that become promoted WorkItem
+ * columns; every other key is preserved in `meta`. `attempts`/`exhausted`/
+ * `ready` are store-side materialized columns — the live read leaves them at
+ * their defaults and never reads them back from the file.
+ */
+const PROMOTED_FIELDS = new Set([
+  "id",
+  "kind",
+  "unit",
+  "status",
+  "workflow_status",
+  "region",
+  "symbol",
+  "address",
+  "milestone",
+  "required_level",
+  "size",
+  "source",
+  "attempts",
+  "exhausted",
+  "ready",
+]);
+
+/**
+ * SPEC §6.4 lifecycle translation: coop `workflow_status` → core lifecycle.
+ * Missing and un-mapped values both fall back to "pending" (missing is
+ * explicitly spec'd; unknown values default the same way rather than leak
+ * un-mapped vocabulary into the core-owned lifecycle column).
+ */
+const LIFECYCLE_MAP: Record<string, string> = {
+  DISCOVERY: "pending",
+  QUEUED: "pending",
+  CLAIMED: "pending",
+  ACTIVE: "pending",
+  BACKLOG: "blocked",
+  BLOCKED: "blocked",
+  ACCEPTED: "accepted",
+  REVALIDATION_REQUIRED: "revalidation_required",
+  NOT_REQUIRED: "not_required",
+};
+
+/** Parse-cache entry: the file fingerprint plus the parsed document. */
+interface TargetsCache {
+  key: string;
+  doc: { targets: unknown[] };
+}
+let targetsCache: TargetsCache | null = null;
+
+/**
+ * Read + parse `<root>/tools/coop/targets.json`, validating the coop shape
+ * (`{ targets: [...] }`). The module-level cache is keyed by
+ * `path:mtimeMs:size` — repeated imports of the unchanged 18 MB registry
+ * reuse the cached parse instead of re-reading and re-JSON-parsing it;
+ * any mtime or size change re-parses.
+ */
+function loadTargetsJson(path: string): { targets: unknown[] } {
+  let stat: ReturnType<typeof statSync>;
+  try {
+    stat = statSync(path);
+  } catch {
+    throw new Error(
+      `xenoblade adapter: targets.json not found at ${path} ` +
+        `(set DECOMPI_XENOBLADE_ROOT to the xenoblade repo checkout)`,
+    );
+  }
+  const key = `${path}:${stat.mtimeMs}:${stat.size}`;
+  if (targetsCache !== null && targetsCache.key === key) return targetsCache.doc;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    throw new Error(
+      `xenoblade adapter: cannot parse ${path}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  const targets = (parsed as { targets?: unknown } | null)?.targets;
+  if (!Array.isArray(targets)) {
+    throw new Error(
+      `xenoblade adapter: ${path} has no "targets" array (expected the coop targets.json shape)`,
+    );
+  }
+  const doc = { targets };
+  targetsCache = { key, doc };
+  return doc;
+}
+
+/** A targets.json entry value as a non-empty string, else undefined. */
+function str(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/** Parse a coop hex size ("0x29C") to bytes; unparseable → undefined. */
+function parseSize(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  const hex = value.trim().replace(/^0[xX]/, "");
+  if (hex.length === 0) return undefined;
+  const n = Number.parseInt(hex, 16);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/** Map one targets.json entry to a WorkItem (SPEC §6.4 field map). */
+function mapTarget(raw: unknown, index: number, defaultRegion: string): WorkItem {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(
+      `xenoblade adapter: targets[${index}] is not an object (expected a targets.json entry)`,
+    );
+  }
+  const entry = raw as Record<string, unknown>;
+  const id = str(entry.id);
+  if (id === undefined) {
+    // Mandatory id preservation (SPEC §6.4): ids are the join key for deps,
+    // ledger attempts, and asm data — never re-generated, never dropped.
+    throw new Error(
+      `xenoblade adapter: targets[${index}] has no "id" (target ids must be preserved)`,
+    );
+  }
+  // Older live-registry entries predate a `kind` column; every one of them is
+  // a function target, so "function" is the lenient default. The status
+  // default mirrors the adapter's "not started yet" baseline.
+  const kind = str(entry.kind) ?? "function";
+  const status = str(entry.status) ?? "NOT_STARTED";
+  const meta: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(entry)) {
+    if (!PROMOTED_FIELDS.has(key)) meta[key] = value;
+  }
+  return {
+    id,
+    kind,
+    lifecycle: LIFECYCLE_MAP[str(entry.workflow_status) ?? ""] ?? "pending",
+    status,
+    unitId: str(entry.unit),
+    region: str(entry.region) ?? defaultRegion,
+    symbol: str(entry.symbol),
+    address: str(entry.address),
+    milestone: str(entry.milestone),
+    requiredLevel: str(entry.required_level),
+    size: parseSize(entry.size),
+    source: str(entry.source),
+    attempts: 0,
+    exhausted: false,
+    ready: false,
+    meta,
+  };
+}
 
 /**
  * Resolve the xenoblade repo root: `DECOMPI_XENOBLADE_ROOT` →
@@ -277,13 +433,25 @@ export class XenobladeAdapter implements GameAdapter {
     return "";
   }
 
-  /** The targets.json import is the M2 migration milestone (SPEC §6.4) —
-   * loudly refuse rather than import nothing. */
+  /**
+   * SPEC §6.4 live read (M5 cut-over): parse `<root>/tools/coop/targets.json`
+   * (root resolved exactly like `diffEngine()` — DECOMPI_XENOBLADE_ROOT →
+   * XENOBLADE_REPO → the sibling checkout) and map every target to a
+   * WorkItem. This is a READ, not a migration: promoted columns follow the
+   * §6.4 field map, materialized columns (`attempts`/`exhausted`/`ready`)
+   * stay at their defaults, and every un-mapped field (instruction_match,
+   * called_functions, depends_on, capabilities, …) is preserved in `meta`.
+   * The parsed file is cached module-level (keyed by mtime/size), so
+   * repeated imports of the 18 MB registry don't re-parse it. The store
+   * insert is the daemon's job (`StoreDaemon.importWorkItems`); this adapter
+   * only reads.
+   */
   async importWorkItems(_ctx: AdapterCtx): Promise<WorkItem[]> {
-    throw new Error(
-      "xenoblade adapter: importWorkItems is not implemented in M2.5 " +
-        "(the targets.json migration lands with the M2 milestone)",
+    const defaultRegion = process.env.DECOMPI_XENOBLADE_REGION ?? "us";
+    const doc = loadTargetsJson(
+      join(resolveXenobladeRoot(), "tools", "coop", "targets.json"),
     );
+    return doc.targets.map((target, index) => mapTarget(target, index, defaultRegion));
   }
 }
 

@@ -17,7 +17,6 @@ import type { WorkflowCompletionStore } from "./completions.js";
 import { compileWorkflow } from "./compile.js";
 import { HelperRegistry, type WorkflowHelpers } from "./helpers.js";
 import type { Workflow } from "./types.js";
-
 /**
  * The scheduler surface the facade needs — structural, so a test stub (or
  * the real `RunScheduler`) satisfies it.
@@ -40,6 +39,12 @@ export interface DecompiDeps {
    * targets. Absent = plans stay fully selectable (stub-until-daemon).
    */
   completions?: WorkflowCompletionStore;
+  /**
+   * Adapter-wide helper registry (SPEC §3): compiled onto registered
+   * workflows as their run default — the engine materializes it into
+   * `ctx.helpers` when the run context supplies none.
+   */
+  helpers?: HelperRegistry;
 }
 
 class DecompiFacade {
@@ -66,6 +71,7 @@ class DecompiFacade {
     const deps = this.requireDeps("addWorkflow");
     const { pipeline, fragments } = compileWorkflow(w, {
       ...(deps.completions !== undefined ? { completions: deps.completions } : {}),
+      ...(deps.helpers !== undefined ? { helpers: deps.helpers } : {}),
     });
     // SPEC §3: a workflow-local helper shadowing a registered global one is
     // detected at addWorkflow and logged (the engine merges last-wins).

@@ -30,7 +30,7 @@ import type { Pipeline, Route, Step, StepCtx } from "../pipeline/types.js";
 import type { Selector, WorkItem } from "../types.js";
 import type { WorkflowCompletionStore } from "./completions.js";
 import { makeBuiltinHelpers, makeStartJsonAgent } from "./helpers.js";
-import type { ReadonlyStore, WorkflowHelpers } from "./helpers.js";
+import type { HelperRegistry, ReadonlyStore, WorkflowHelpers } from "./helpers.js";
 import type {
   RunScope,
   Workflow,
@@ -53,6 +53,14 @@ export interface CompileOptions {
    * fully selectable until then).
    */
   completions?: WorkflowCompletionStore;
+  /**
+   * Adapter-wide helper registry (SPEC §3): compiled ONTO the pipeline as
+   * its run default — the engine materializes it into `ctx.helpers` (via
+   * `RunState` → `StepCtx`) when the run context supplies none. Absent =
+   * the run context must carry the registry (or hooks see only built-ins +
+   * workflow-local helpers).
+   */
+  helpers?: HelperRegistry;
 }
 
 /** A compiled workflow: the runnable pipeline plus its `onReject` fragments. */
@@ -263,6 +271,7 @@ export function compileWorkflow<K extends WorkItemKind, H extends Record<string,
   const pipeline: Pipeline = {
     id: w.id,
     adapter: "workflow",
+    ...(opts?.helpers !== undefined ? { helpers: opts.helpers } : {}),
     plan: async (ctx: PlanCtx) => {
       const items = await ctx.select(selector);
       const scoped = applyScopeSelector(items, ctx.scope);

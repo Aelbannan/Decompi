@@ -43,6 +43,8 @@ import type { AgentResult, AgentRuntime, SessionUsage } from "../agent/runtime.j
 import { PromptBuilder, type PromptSpec } from "../prompt/builder.js";
 import type { Pipeline, Route, Step, StepCtx, StepOutcome, Trigger } from "./types.js";
 import type { WorkflowConfig } from "../workflow/types.js";
+import type { WorkflowCompletionStore } from "../workflow/completions.js";
+import type { HelperRegistry } from "../workflow/helpers.js";
 
 /** One executed agent turn: resolved model, final text, and token usage. */
 export interface AgentTurn {
@@ -68,10 +70,25 @@ export interface RunContext {
   styleGuidePath?: string;
   /**
    * Completion writer for `agentLoop` accepted items (SPEC §4): called with
-   * `{ promote: true }` per accepted item. Defaults to a no-op; the
-   * workflow/daemon integration supplies the transactional writer.
+   * `{ promote: true }` per accepted item. Defaults to a no-op when the run
+   * supplies no writer; the workflow/daemon integration supplies the
+   * transactional writer.
    */
   finalize?: (item: WorkItem, action: unknown) => Promise<void>;
+  /**
+   * Workflow completion store (SPEC §5): when the run supplies no
+   * `finalize`, accepted `{ promote: true }` items record a precise
+   * `(workflow, unit, target)` completion row through it, so a later plan
+   * for the same pipeline/workflow skips them. The daemon's transactional
+   * writer overrides this when wired as `finalize`.
+   */
+  completions?: WorkflowCompletionStore;
+  /**
+   * Adapter-wide helper registry (SPEC §3): merged into `ctx.helpers` for
+   * workflow hooks (before workflow-local helpers, which win). Falls back to
+   * the pipeline's compiled `helpers` when absent.
+   */
+  helpers?: HelperRegistry;
 }
 
 /** Terminal outcome of a run. `accepted`/`rejected`/`skipped` are disjoint. */
@@ -109,6 +126,8 @@ interface RunState {
   lastAgentResult?: AgentTurn;
   /** Completion writer for `agentLoop` accepted items (default: no-op). */
   finalize: (item: WorkItem, action: unknown) => Promise<void>;
+  /** Adapter-wide helper registry merged into `ctx.helpers` (SPEC §3). */
+  helpers?: HelperRegistry;
 }
 
 /** Engine-internal context: `StepCtx` + the scope's model + run state. */
@@ -161,6 +180,34 @@ const NOOP_LOG = (_level: string, _msg: string): void => {};
 
 /** Default `finalize`: a run without a completion writer accepts nothing. */
 const NOOP_FINALIZE = async (_item: WorkItem, _action: unknown): Promise<void> => {};
+
+/**
+ * Build the default completion writer for a run with a workflow completion
+ * store (SPEC §5): every `{ promote: true }` finalize action records a
+ * precise `(workflow, unit, target)` completion row, so a later plan for the
+ * same pipeline/workflow skips the target (`isComplete(wf, ·)` — the
+ * compile-time capture in `compileWorkflow`). A run-supplied `finalize`
+ * (e.g. the daemon's transactional writer) always overrides this.
+ */
+function storeFinalize(
+  completions: WorkflowCompletionStore,
+  pipelineId: string,
+): (item: WorkItem, action: unknown) => Promise<void> {
+  return async (item, action) => {
+    const promote =
+      typeof action === "object" &&
+      action !== null &&
+      (action as { promote?: unknown }).promote === true;
+    if (!promote) return; // non-promote actions never record a completion row
+    await completions.complete({
+      workflowId: pipelineId,
+      unitId: item.unitId ?? "",
+      targetId: item.id,
+      actor: "run",
+      reason: "run-time",
+    });
+  };
+}
 
 /** Append every `foreach.onReject[].to` reachable in `steps` (nested foreach included). */
 function collectRouteTargets(steps: readonly Step[], out: string[]): void {
@@ -251,7 +298,12 @@ export class PipelineEngine {
       defaultModel: ctx0.defaultModel,
       attempts: new Map(),
       ...(ctx0.styleGuidePath !== undefined ? { styleGuidePath: ctx0.styleGuidePath } : {}),
-      finalize: ctx0.finalize ?? NOOP_FINALIZE,
+      // Adapter-wide helpers: an explicit run-context registry wins; the
+      // pipeline's compiled default (workflow compiler) fills the gap.
+      helpers: ctx0.helpers ?? pipeline.helpers,
+      finalize:
+        ctx0.finalize ??
+        (ctx0.completions !== undefined ? storeFinalize(ctx0.completions, id) : NOOP_FINALIZE),
     };
     state.log("info", `run ${id}: start (model=${ctx0.defaultModel})`);
     const ctx = this.makeCtx(state, ctx0.defaultModel);
@@ -364,6 +416,7 @@ export class PipelineEngine {
       },
       log: state.log,
       finalize: state.finalize,
+      ...(state.helpers !== undefined ? { helpers: state.helpers } : {}),
       model,
       state,
       rejectionRetriesOverride,
