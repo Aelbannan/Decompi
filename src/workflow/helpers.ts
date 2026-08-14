@@ -14,8 +14,12 @@
  * `execute`/`transaction`, preserving the engine's single-writer discipline
  * (SPEC §3, §5.3).
  */
+import { toJSONSchema } from "zod";
+import type { z } from "zod";
+import type { AgentRuntime } from "../agent/runtime.js";
 import type { SqlAdapter } from "../core/store/adapter.js";
 import type { Selector, WorkItem } from "../types.js";
+import { JudgeError } from "./types.js";
 
 /**
  * Read-only store surface exposed to workflow hooks — `query` only, no
@@ -81,6 +85,15 @@ export class HelperRegistry {
   has(name: string): boolean {
     return this.fns.has(name);
   }
+
+  /**
+   * Every registered helper as a name→fn record — the engine merges this
+   * into `ctx.helpers` (adapter-wide registration, before workflow-local
+   * `helpers`).
+   */
+  toObject(): Record<string, unknown> {
+    return Object.fromEntries(this.fns);
+  }
 }
 
 const INTERPOLATION = /\$\{([^}]+)\}/g;
@@ -117,7 +130,8 @@ export function renderTemplate(template: string, ctx: Record<string, unknown>): 
 /**
  * Build the built-in helper set for a workflow engine.
  *
- * @param store  the engine's `SqlAdapter` (surfaced read-only via `store`).
+ * @param store  the engine's read-only store view (`query` only — surfaced
+ *   as `helpers.store`; the same surface hooks see as `ctx.store`).
  * @param select the store-backed `Selector` resolver (same one `plan` uses).
  * @param emitFn optional event writer override (e.g. a daemon-backed INSERT
  *   into `events`). Defaults to a **no-op stub resolving `0`** — the daemon
@@ -125,7 +139,7 @@ export function renderTemplate(template: string, ctx: Record<string, unknown>): 
  *   testable without a live daemon.
  */
 export function makeBuiltinHelpers(
-  store: SqlAdapter,
+  store: ReadonlyStore,
   select: (s: Selector) => Promise<WorkItem[]>,
   emitFn?: (type: string, data: unknown) => Promise<number>,
 ): WorkflowHelpers {
@@ -145,4 +159,90 @@ export function makeBuiltinHelpers(
     // local `helpers`) before hooks ever see `ctx.helpers`. The literal
     // itself stays fully typed — every member is written out explicitly.
   } as WorkflowHelpers;
+}
+
+// --------------------------------------------------------------------------
+// ctx.StartJsonAgent — the stateless judge agent (SPEC §A.2)
+// --------------------------------------------------------------------------
+
+/**
+ * `ctx.StartJsonAgent` — a separate, stateless judge agent. The schema type
+ * param drives the return: `z.infer<S>` with NO `any`.
+ */
+export type StartJsonAgent = <S extends z.ZodType>(
+  model: string,
+  prompt: string,
+  input: unknown,
+  schema: S,
+) => Promise<z.infer<S>>;
+
+/** Retry cap: the initial attempt plus ONE retry (SPEC §A.2 "retry once"). */
+const MAX_JUDGE_ATTEMPTS = 2;
+
+/** The JSON-mode turn instruction (SPEC §A.2): a single JSON object, schema-constrained. */
+function jsonModeInstruction(schemaText: string): string {
+  return `Respond with a single JSON object matching this schema: ${schemaText}`;
+}
+
+/**
+ * Render a zod schema for the JSON-mode instruction. Prefers a proper JSON
+ * Schema via `toJSONSchema` (zod v4); falls back to the raw schema's JSON,
+ * then `String(schema)` — the instruction must never throw.
+ */
+function describeSchema(schema: z.ZodType): string {
+  try {
+    return JSON.stringify(toJSONSchema(schema));
+  } catch {
+    try {
+      return JSON.stringify(schema);
+    } catch {
+      return String(schema);
+    }
+  }
+}
+
+/** Stringify `input` for the judge turn: strings pass through, else JSON. */
+function renderInput(input: unknown): string {
+  if (typeof input === "string") return input;
+  try {
+    return JSON.stringify(input) ?? String(input);
+  } catch {
+    return String(input);
+  }
+}
+
+/**
+ * Bind `ctx.StartJsonAgent` to a runtime (SPEC §A.2): each call opens a
+ * FRESH session (`createSession({ model, prompt })`), feeds ONE JSON-mode
+ * turn with `input`, and zod-parses the reply. Non-JSON / schema-invalid
+ * output retries once with a fresh session, then throws `JudgeError`. Every
+ * attempt is a normal runtime turn — pacing, budget pre-checks, and charging
+ * are handled by the (wrapped) runtime, exactly like `agent` steps.
+ */
+export function makeStartJsonAgent(runtime: AgentRuntime): StartJsonAgent {
+  return async (model, prompt, input, schema) => {
+    const schemaText = describeSchema(schema);
+    let attempts = 0;
+    for (;;) {
+      attempts++;
+      // Stateless judge: never shares the agentLoop's session; each attempt
+      // is a fresh session so a failed reply cannot poison the next one.
+      const session = await runtime.createSession({ model, prompt });
+      const turn = jsonModeInstruction(schemaText);
+      const payload = input === undefined ? turn : `${turn}\n\nInput:\n${renderInput(input)}`;
+      const reply = await session.prompt(payload);
+      try {
+        return schema.parse(JSON.parse(reply.finalText));
+      } catch (cause) {
+        if (attempts >= MAX_JUDGE_ATTEMPTS) {
+          throw new JudgeError(
+            `StartJsonAgent: judge output was not valid JSON for the schema after ${attempts} attempt(s)`,
+            attempts,
+            { cause },
+          );
+        }
+        // Retry once with a fresh session.
+      }
+    }
+  };
 }

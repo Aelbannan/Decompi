@@ -25,6 +25,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { parseCpp } from "./tree.js";
 import { smellRules } from "./rules/smell.js";
+import { makeDefineRenameAliasRule } from "./rules/smell.js";
 import { pointerRules } from "./rules/pointer.js";
 import { cloneRules } from "./rules/clone.js";
 import { matchRules, type MatchRuleContext } from "./rules/match.js";
@@ -53,12 +54,11 @@ function isCppTU(path: string): boolean {
  * Per-file lint configuration.
  *
  * `placeholderPatterns` mirrors the SPEC §13.1/§13.2 configurable placeholder
- * families. Two keys are consumed today, both by the delta gate: `unknown`
- * feeds `no_unk_name` (unkN identifiers) and `class` feeds `no_unk_generated`
- * (`UnkClass_*`, `UnkVirtualFunc*`, `UnkStruct*` …). `function`/`label`/`data`
- * are reserved for the store-backed matched-function smells
- * (`match.func_placeholder`, `match.class_placeholder`, …) that arrive with
- * the store milestone. In a `--config` file patterns are JSON strings; in
+ * families. Three consumers: `unknown` feeds `no_unk_name` (unkN
+ * identifiers) and `class` feeds `no_unk_generated` (`UnkClass_*`,
+ * `UnkVirtualFunc*`, `UnkStruct*` …) in the delta gate, and
+ * `function`/`label`/`data` feed the `smell.define_rename_alias` whole-file
+ * rule (SPEC §B). In a `--config` file patterns are JSON strings; in
  * process, RegExp literals are accepted directly.
  */
 export interface LintConfig {
@@ -90,20 +90,47 @@ function sortByLine<T extends { line: number }>(findings: T[]): T[] {
 }
 
 /**
+ * Compile a placeholder pattern to RegExp for the `smell.define_rename_alias`
+ * rule (SPEC §B): the adapter declares patterns as strings, so string configs
+ * are compiled here; RegExp literals pass through. Empty-source patterns
+ * (an adapter declaring `label: ""` / `data: ""`) are dropped so they cannot
+ * match every name (`new RegExp("")` has source `(?:)`).
+ */
+function compilePlaceholderPattern(p: RegExp | string | undefined): RegExp | undefined {
+  if (p === undefined) return undefined;
+  const re = typeof p === "string" ? new RegExp(p) : p;
+  return re.source === "(?:)" ? undefined : re;
+}
+
+/**
  * Run every source rule over `source` — a whole-file scan — returning
  * findings sorted by (line, rule-registry order).
  *
  * `path` drives the `smell.class_in_cpp` / `smell.struct_in_cpp` gate: those
  * two rules fire only for `.cpp`/`.cc`/`.cxx` translation units (definitions
  * in headers are the desired location, never a smell). `cfg.match` (the
- * fixture-backed work-item context) appends the `match.*` rules.
+ * fixture-backed work-item context) appends the `match.*` rules;
+ * `cfg.placeholderPatterns.function`/`.label`/`.data` append the
+ * `smell.define_rename_alias` rule (SPEC §B) — without placeholder patterns
+ * the rule does not run at all.
  */
 export function lintFile(path: string, source: string, cfg?: LintConfig): Finding[] {
   const { root } = parseCpp(source);
   const base = cfg?.match !== undefined ? [...sourceRules, ...matchRules(cfg.match)] : sourceRules;
-  const rules = isCppTU(path)
+  let rules = isCppTU(path)
     ? base
     : base.filter((r) => r.id !== "smell.class_in_cpp" && r.id !== "smell.struct_in_cpp");
+  const pp = cfg?.placeholderPatterns;
+  if (pp !== undefined && (pp.function !== undefined || pp.label !== undefined || pp.data !== undefined)) {
+    rules = [
+      ...rules,
+      makeDefineRenameAliasRule({
+        function: compilePlaceholderPattern(pp.function),
+        label: compilePlaceholderPattern(pp.label),
+        data: compilePlaceholderPattern(pp.data),
+      }),
+    ];
+  }
   return sortByLine(rules.flatMap((rule) => rule.run(root, source)));
 }
 

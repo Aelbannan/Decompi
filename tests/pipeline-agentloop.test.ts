@@ -99,10 +99,12 @@ test("agentLoop: accepted items are finalized; final:true routes the remainder t
   });
 
   // ONE agentLoop session (start prompt seeds it), then one retry-fragment
-  // session for the routed remainder. `final:true` cut the loop at turn 1.
+  // session for the routed remainder. `final:true` cut the loop at turn 1 —
+  // but its feedback was still delivered as ONE write-only wrap-up turn
+  // (SPEC §A.5), so the session saw exactly two prompts.
   assert.equal(rt.calls.length, 2);
   assert.equal(sessions.length, 2);
-  assert.equal(sessions[0]!.promptHistory.length, 1);
+  assert.deepEqual(sessions[0]!.promptHistory, ["work on: a,b,c,d,e", "fix the rest"]);
   for (const i of items) assert.match(rt.calls[0]!.prompt, new RegExp(i.id));
   // The 3 accepted items were finalized with the promote action.
   assert.deepEqual(

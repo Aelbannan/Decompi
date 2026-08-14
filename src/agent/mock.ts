@@ -52,6 +52,11 @@ export class MockSession implements AgentSession {
   /** Every prompt() text, in call order. */
   readonly promptHistory: string[] = [];
 
+  /** Seed the scripted-response queue (the runtime's `scripted` option uses this). */
+  constructor(initial: string[] = []) {
+    this.responses.push(...initial);
+  }
+
   prompt(text: string): Promise<AgentResult> {
     this.promptHistory.push(text);
     const finalText =
@@ -71,13 +76,24 @@ export class MockAgentRuntime implements AgentRuntime {
   readonly models = new Map<string, ModelSpec>();
   /** Every createSession() call, in order (incl. rejected/unknown models). */
   readonly calls: RuntimeCall[] = [];
+  /**
+   * Scripted reply queues, one per created session (index = session creation
+   * order). A session without a queue falls back to prompt-derived replies.
+   */
+  readonly scripted: string[][];
+  /** Every created session, in creation order (for prompt/usage assertions). */
+  readonly sessions: MockSession[] = [];
 
-  constructor(models?: Record<string, ModelSpec> | Iterable<[string, ModelSpec]>) {
+  constructor(
+    models?: Record<string, ModelSpec> | Iterable<[string, ModelSpec]>,
+    scripted: string[][] = [],
+  ) {
     if (models) {
       const entries =
         models instanceof Map ? models : Object.entries(models);
       for (const [name, spec] of entries) this.models.set(name, spec);
     }
+    this.scripted = scripted;
   }
 
   /** Register (or overwrite) a model spec under `name`. */
@@ -105,6 +121,8 @@ export class MockAgentRuntime implements AgentRuntime {
         `MockAgentRuntime: unknown model "${opts.model}" (call register() first)`,
       );
     }
-    return new MockSession();
+    const session = new MockSession(this.scripted[this.calls.length - 1] ?? []);
+    this.sessions.push(session);
+    return session;
   }
 }

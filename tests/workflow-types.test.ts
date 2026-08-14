@@ -15,6 +15,7 @@
  */
 import { test, mock } from "node:test";
 import assert from "node:assert/strict";
+import { z } from "zod";
 
 import { Workflow, type WorkItemOf } from "../src/workflow/types.js";
 import { HelperRegistry, makeBuiltinHelpers } from "../src/workflow/helpers.js";
@@ -58,6 +59,15 @@ test("Workflow: kind narrowing, augmented + local helpers, typed verdict", async
       void lastTurn.text; // AgentTurn available as third hook param
       return { accepted: targets, rejected: [], feedback: `turn said: ${lastTurn.text}` };
     },
+    // SPEC §A.1/§A.2: setup returns a typed WorkflowConfig and can call the
+    // zod-typed StartJsonAgent (T inferred from the schema, no `any`).
+    setup: async (_targets, ctx) => {
+      const JudgeOut = z.object({ shouldContinue: z.boolean(), message: z.string() });
+      const j = await ctx.StartJsonAgent("nube-ds4-flash-low", "converging?", { last: "turn" }, JudgeOut);
+      const shouldContinue: boolean = j.shouldContinue; // inferred, not any
+      void shouldContinue;
+      return { batchSize: 2, model: "nube-ds4-flash-low", rejectionRetries: 1 };
+    },
   });
 
   assert.equal(wf.id, "basic-match");
@@ -86,6 +96,26 @@ test("Workflow: negative typing cases (@ts-expect-error)", () => {
       void ctx.helpers.nope;
       // @ts-expect-error local helper `d` requires FunctionWorkItem, not the fallback kind
       await ctx.helpers.d(null as unknown as WorkItemOf<"object">);
+      return "";
+    },
+    reprompt: async () => ({ accepted: [], rejected: [] }),
+  });
+
+  new Workflow({
+    id: "negative-setup",
+    accepts: "function",
+    startPrompt: async () => "",
+    reprompt: async () => ({ accepted: [], rejected: [] }),
+    // @ts-expect-error WorkflowConfig.batchSize must be a number, not a string
+    setup: async () => ({ batchSize: "two" }),
+  });
+
+  new Workflow({
+    id: "negative-json-agent",
+    accepts: "function",
+    startPrompt: async (_targets, ctx) => {
+      // @ts-expect-error StartJsonAgent's schema must be a zod schema (infer drives the return)
+      await ctx.StartJsonAgent("m", "p", {}, { parse: 1 });
       return "";
     },
     reprompt: async () => ({ accepted: [], rejected: [] }),

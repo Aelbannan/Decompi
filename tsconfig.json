@@ -12,6 +12,6 @@
     "outDir": "dist",
     "rootDir": "."
   },
-  "include": ["src/**/*", "adapters/**/*", "pipelines/**/*", "tests/workflow-types.test.ts"],
+  "include": ["src/**/*", "adapters/**/*", "pipelines/**/*", "examples/**/*", "tests/workflow-types.test.ts", "tests/examples.test.ts"],
   "exclude": ["node_modules", "dist", "web"]
 }

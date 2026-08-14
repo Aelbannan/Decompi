@@ -7,13 +7,20 @@
  *    into batches of `batch` and runs its child `steps` once PER batch (one
  *    agent session per batch — v1's `batchSize`); `foreach.from` pulls the
  *    items from a `select`-produced binding (default: current scope items);
+ *    a `foreach` may carry a `setup` hook (SPEC §A.1) run ONCE per drawn
+ *    batch, before the body — it may sub-divide the batch (excess returns to
+ *    the FRONT of the queue, so every processed window ≤ the static `batch`)
+ *    and override the batch's `model` / `rejectionRetries`;
  *  - `verify` looks up `verifiers.get(name)` and splits items into
  *    accepted (finalized) / rejected (still in play: the next step sees them);
  *  - `agentLoop` holds ONE agent session across re-prompt turns: accepted
  *    items are finalized (via `ctx.finalize`) and leave play; rejected and
  *    absent items stay in play until the loop exits (empty play, `final`, or
  *    the `rejectionRetries` cap) and then surface as rejected (routed by
- *    `onReject` inside a foreach);
+ *    `onReject` inside a foreach); on `verdict.final` the loop may deliver
+ *    `feedback` as ONE write-only turn (SPEC §A.5) whose reply is NOT
+ *    re-evaluated — the still-in-play items route through the enclosing
+ *    foreach exactly once;
  *  - `gate` false aborts the CURRENT scope: remaining steps are skipped and
  *    the scope's items surface in the run outcome as `skipped` (they are
  *    never routed through `onReject` — a gate is a skip, not a failure);
@@ -35,6 +42,7 @@ import type { Selector, Verifier, WorkItem } from "../types.js";
 import type { AgentResult, AgentRuntime, SessionUsage } from "../agent/runtime.js";
 import { PromptBuilder, type PromptSpec } from "../prompt/builder.js";
 import type { Pipeline, Route, Step, StepCtx, StepOutcome, Trigger } from "./types.js";
+import type { WorkflowConfig } from "../workflow/types.js";
 
 /** One executed agent turn: resolved model, final text, and token usage. */
 export interface AgentTurn {
@@ -110,6 +118,12 @@ interface RunCtx extends StepCtx {
   state: RunState;
   /** Most recent agent turn in this context (set by `agent` steps). */
   lastAgentResult?: AgentTurn;
+  /**
+   * Per-scope `rejectionRetries` override from a `foreach.setup` (SPEC §A.1):
+   * the scope's `agentLoop` reads this before its own `rejectionRetries`.
+   * Forked scopes inherit it, so a `setup` override reaches nested loops too.
+   */
+  rejectionRetriesOverride?: number;
 }
 
 /** Step execution result. `skipped` = gate-aborted items; `aborted` = a gate fired false. */
@@ -337,7 +351,7 @@ export class PipelineEngine {
 
   // -- context plumbing --
 
-  private makeCtx(state: RunState, model: string): RunCtx {
+  private makeCtx(state: RunState, model: string, rejectionRetriesOverride?: number): RunCtx {
     const ctx: RunCtx = {
       runtime: state.runtime,
       verifiers: state.verifiers,
@@ -352,6 +366,7 @@ export class PipelineEngine {
       finalize: state.finalize,
       model,
       state,
+      rejectionRetriesOverride,
       lastAgentResult: state.lastAgentResult,
     };
     return ctx;
@@ -359,7 +374,7 @@ export class PipelineEngine {
 
   /** A child context over the given items (shares runtime/verifiers/bindings/state). */
   private forkCtx(parent: RunCtx, items: WorkItem[]): RunCtx {
-    const ctx = this.makeCtx(parent.state, parent.model);
+    const ctx = this.makeCtx(parent.state, parent.model, parent.rejectionRetriesOverride);
     ctx.items = items;
     return ctx;
   }
@@ -440,18 +455,23 @@ export class PipelineEngine {
   }
 
   /**
-   * `agentLoop` (SPEC §4): hold ONE agent session across re-prompt turns over
-   * the scope's items (a `foreach` body's batch, or the scope at top level).
-   * Each turn renders the next prompt (start text, then `verdict.feedback`)
-   * and prompts the session through the engine's wrapped runtime — the same
-   * `createSession`/`prompt` path as `agent` steps — so per-turn pacing,
-   * budget checks, and pause apply without re-implementation. `reprompt`
-   * decides the verdict: ONLY `accepted` items leave play (each finalized via
-   * `ctx.finalize?.(item, { promote: true })`, a no-op when the run supplies
-   * no writer); `rejected` and absent items STAY in play. The loop exits when
-   * nothing is in play, on `verdict.final`, or once `turns >= rejectionRetries`
-   * (default 1); the still-in-play items surface as rejected so `onReject`
-   * routes them.
+   * `agentLoop` (SPEC §4, §A.5): hold ONE agent session across re-prompt turns
+   * over the scope's items (a `foreach` body's batch, or the scope at top
+   * level). Each turn renders the next prompt (start text, then
+   * `verdict.feedback`) and prompts the session through the engine's wrapped
+   * runtime — the same `createSession`/`prompt` path as `agent` steps — so
+   * per-turn pacing, budget checks, and pause apply without re-implementation.
+   * `reprompt` decides the verdict: ONLY `accepted` items leave play (each
+   * finalized via `ctx.finalize?.(item, { promote: true })`, a no-op when the
+   * run supplies no writer); `rejected` and absent items STAY in play. The
+   * loop exits when nothing is in play, on `verdict.final`, or once
+   * `turns >= rejectionRetries` (default 1; a per-scope override from
+   * `foreach.setup` wins over the step's value). On `verdict.final` with
+   * `feedback`, the feedback is delivered as ONE final, write-only turn — a
+   * real model call, but its reply is NOT re-evaluated (no reprompt, no
+   * AgentTurn). The still-in-play items surface as rejected so the ENCLOSING
+   * foreach routes them via `onReject` (single routing: the loop never routes
+   * itself).
    */
   private async runAgentLoopStep(
     step: Extract<Step, { kind: "agentLoop" }>,
@@ -462,7 +482,10 @@ export class PipelineEngine {
       return { accepted: [], rejected: [], skipped: [], aborted: false };
     }
     const model = step.model ?? ctx.model;
-    const rejectionRetries = step.rejectionRetries ?? 1;
+    // A per-scope override from `foreach.setup` (SPEC §A.1) beats the step's
+    // own cap: the compiled workflow's `def.rejectionRetries` lives on the
+    // step, so `setup.rejectionRetries` must be able to override it.
+    const rejectionRetries = ctx.rejectionRetriesOverride ?? step.rejectionRetries ?? 1;
     const finalize = ctx.finalize ?? NOOP_FINALIZE;
     // ONE session is held across every turn (SPEC §4). The run-time wrapper
     // (budget/pacing) applies at session creation AND on each prompt() turn.
@@ -507,7 +530,19 @@ export class PipelineEngine {
         `agentLoop: turn ${turns} accepted ${verdict.accepted.length}, in play ${inPlay.length} (model=${model})`,
       );
       if (inPlay.length === 0) break;
-      if (verdict.final === true || turns >= rejectionRetries) break;
+      if (verdict.final === true) {
+        // SPEC §A.5: ONE final, write-only "wrap it up" turn. The feedback is
+        // delivered (logged for span completeness; a real model call that
+        // charges the run budget) but the reply is NOT re-evaluated — no
+        // reprompt, no AgentTurn — and inPlay routes through the enclosing
+        // foreach exactly once.
+        if (verdict.feedback) {
+          ctx.log("info", "agentLoop: final write-only turn (wrap-up feedback delivered)");
+          await session.prompt(verdict.feedback);
+        }
+        break;
+      }
+      if (turns >= rejectionRetries) break;
       prompt = verdict.feedback ?? prompt;
     }
 
@@ -597,10 +632,45 @@ export class PipelineEngine {
     const unchanged: WorkItem[] =
       step.from === undefined ? [] : ctx.items.filter((i) => !sourceIds.has(i.id));
 
-    for (const batch of this.partition(source!, step.batch, step.key)) {
+    // Batch queue (SPEC §A.1): `setup` may sub-divide a drawn batch; the
+    // excess returns to the FRONT of the queue, so the next window is drawn
+    // from the same ordered remainder (order/grouping is never re-shuffled).
+    const queue: WorkItem[][] = this.partition(source!, step.batch, step.key);
+
+    while (queue.length > 0) {
+      const batch = queue.shift()!;
       ctx.log("info", `foreach: batch of ${batch.length} item(s)`);
+
+      // Per-batch config hook (SPEC §A.1): run ONCE per drawn batch, before
+      // the body. `setup` sees the full drawn batch (body.items === batch)
+      // and may sub-divide it, pick the batch's model, or override the
+      // re-prompt cap.
       const body = this.forkCtx(ctx, batch);
-      const res = await this.runScope(body, step.steps, batch);
+      let cfg: WorkflowConfig = {};
+      let window = batch;
+      if (step.setup !== undefined) {
+        cfg = await step.setup(batch, body);
+        if (
+          cfg.batchSize !== undefined &&
+          (!Number.isInteger(cfg.batchSize) || cfg.batchSize < 1)
+        ) {
+          throw new Error(
+            `foreach: setup() returned an invalid batchSize (got ${String(cfg.batchSize)}); ` +
+              "batchSize must be an integer >= 1 (it may only sub-divide the current batch)",
+          );
+        }
+        if (cfg.batchSize !== undefined && cfg.batchSize < batch.length) {
+          queue.unshift(batch.slice(cfg.batchSize));
+          window = batch.slice(0, cfg.batchSize);
+        }
+      }
+      // Per-batch overrides: fork the ctx with the setup model (the batch's
+      // `agentLoop` resolves `step.model ?? ctx.model`); the retries override
+      // is read by the `agentLoop` before its own `rejectionRetries`.
+      if (cfg.model !== undefined) body.model = cfg.model;
+      if (cfg.rejectionRetries !== undefined) body.rejectionRetriesOverride = cfg.rejectionRetries;
+
+      const res = await this.runScope(body, step.steps, window);
       accepted.push(...res.accepted);
       skipped.push(...res.skipped);
       for (const item of res.rejected) {

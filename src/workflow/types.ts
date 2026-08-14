@@ -7,6 +7,7 @@
  * `./compile.ts` (SPEC §4); everything here is fully typed so workflows can
  * be authored before (and independently of) the compiler.
  */
+import type { z } from "zod";
 import type { AgentTurn } from "../pipeline/engine.js";
 import type { Pipeline } from "../pipeline/types.js";
 import type { Selector, WorkItem } from "../types.js";
@@ -53,6 +54,23 @@ export type CompletionAction =
   | { promote: true; status?: string; evidence?: unknown }
   | { status: string };
 
+/**
+ * Per-batch config returned by a workflow's `setup` hook (SPEC §A.1). The
+ * engine runs `setup(batch, ctx)` ONCE per batch, before the `agentLoop`.
+ * `batchSize` (integer >= 1) may only SUB-DIVIDE the current batch — excess
+ * items spill over to the next batch; the batch is never re-shuffled or
+ * enlarged. Precedence for the loop's model: `setup.model` > route-fragment
+ * model > run `defaultModel`.
+ */
+export interface WorkflowConfig {
+  /** Re-prompt cap for this batch (overrides the workflow's `rejectionRetries`). */
+  rejectionRetries?: number;
+  /** Sub-divide the current batch; spillover returns to the front of the queue. */
+  batchSize?: number;
+  /** Judge/loop model for this batch (overrides route/run defaults). */
+  model?: string;
+}
+
 /** Run-scope intersection (SPEC §6): target ids and/or unit ids, AND-ed together. */
 export interface RunScope {
   targetIds?: string[];
@@ -83,6 +101,14 @@ export interface WorkflowDef<
   /** Local helpers, typed `H`; merged into `ctx.helpers` (local shadows global). */
   helpers?: H;
 
+  /**
+   * Per-batch config hook (SPEC §A.1): the engine runs it ONCE per batch,
+   * before the `agentLoop`. Returns a `WorkflowConfig` (batch sub-division /
+   * model / rejectionRetries overrides); the engine consumes it — this field
+   * is compiled onto the `foreach` step.
+   */
+  setup?(targets: WorkItemOf<K>[], ctx: WorkflowCtx<K, H>): Promise<WorkflowConfig>;
+
   /** In-session re-prompt cap (v1 continuation). Default from engine config; per-run overridable. */
   rejectionRetries?: number;
 
@@ -103,6 +129,22 @@ export interface WorkflowDef<
   ): Promise<RepromptVerdict<K>>;
   /** Decider: returns what "complete" means; the engine executes via `ctx.finalize`. */
   complete?(target: WorkItemOf<K>, ctx: WorkflowCtx<K, H>): Promise<CompletionAction>;
+}
+
+/**
+ * Thrown by `ctx.StartJsonAgent` (SPEC §A.2) when the judge replies with
+ * non-JSON or schema-invalid output on every attempt. The workflow catches it
+ * and decides (e.g. treat as non-converging). `attempts` = how many fresh
+ * judge sessions were tried before giving up (2 = initial + one retry).
+ */
+export class JudgeError extends Error {
+  readonly attempts: number;
+
+  constructor(message: string, attempts: number, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "JudgeError";
+    this.attempts = attempts;
+  }
 }
 
 /**
@@ -129,6 +171,18 @@ export interface WorkflowCtx<
   select(selector: Selector): Promise<WorkItem[]>;
   /** Read-only store view (query only). */
   store: ReadonlyStore;
+  /**
+   * Separate stateless judge agent (SPEC §A.2): a FRESH session per call,
+   * ONE JSON-mode turn fed with `input`, zod-validated reply. Non-JSON or
+   * schema-invalid output retries once (fresh session), then throws
+   * `JudgeError`. Each attempt is a normal runtime turn (pacing/budget).
+   */
+  StartJsonAgent<S extends z.ZodType>(
+    model: string,
+    prompt: string,
+    input: unknown,
+    schema: S,
+  ): Promise<z.infer<S>>;
   /** Run logger. */
   log(level: string, msg: string): void;
 }

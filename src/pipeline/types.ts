@@ -21,6 +21,8 @@ import type { AgentRuntime, SessionUsage } from "../agent/runtime.js";
 import type { PromptSpec } from "../prompt/builder.js";
 // Type-only: erased at compile time, so the cycle engine.ts <-> types.ts is safe.
 import type { AgentTurn } from "./engine.js";
+import type { HelperRegistry, ReadonlyStore } from "../workflow/helpers.js";
+import type { WorkflowConfig } from "../workflow/types.js";
 
 /** The most recent agent turn in a scope (set by `agent` steps; shared across foreach forks). */
 export interface LastAgentResult {
@@ -49,7 +51,28 @@ export interface StepCtx {
   finalize?: (item: WorkItem, action: unknown) => Promise<void>;
   /** Most recent agent turn in this scope (agent steps; transforms may read it). */
   lastAgentResult?: LastAgentResult;
+  /**
+   * Read-only store view (`query` only) surfaced to workflow hooks as
+   * `ctx.store` / `ctx.helpers.store` (SPEC §3). Populated by the run
+   * integration; absent = an empty-query stub (stub-until-wired pattern).
+   */
+  store?: ReadonlyStore;
+  /**
+   * Adapter-wide helper registry merged into `ctx.helpers` (before the
+   * workflow's local `helpers`, which win). Populated by the run integration.
+   */
+  helpers?: HelperRegistry;
 }
+
+/**
+ * Per-batch config hook on a compiled `foreach` (SPEC §A.1): the engine runs
+ * it ONCE per drawn batch, before the batch's `agentLoop`. `WorkflowConfig`
+ * may sub-divide the batch (excess returns to the FRONT of the queue, so
+ * every processed window ≤ the static `batch`), pick the loop's model, and
+ * override the re-prompt cap. Compiled from `WorkflowDef.setup`; consumed by
+ * `runForeachStep` in `./engine.ts`.
+ */
+export type ForeachSetup = (targets: WorkItem[], ctx: StepCtx) => Promise<WorkflowConfig>;
 
 /** The smallest executable unit of a pipeline (SPEC §10). */
 export type Step =
@@ -58,7 +81,16 @@ export type Step =
   | { kind: "verify"; verifier: string }
   | { kind: "transform"; fn: (ctx: StepCtx) => Promise<void> }
   | { kind: "select"; selector: Selector; into: string }
-  | { kind: "foreach"; from?: string; batch: number; key?: string; steps: Step[]; onReject?: Route[] }
+  | {
+      kind: "foreach";
+      from?: string;
+      batch: number;
+      key?: string;
+      steps: Step[];
+      onReject?: Route[];
+      /** Per-batch config hook (SPEC §A.1): run once per drawn batch, before the body. */
+      setup?: ForeachSetup;
+    }
   | { kind: "gate"; when: (ctx: StepCtx) => boolean | Promise<boolean> }
   | {
       kind: "agentLoop";

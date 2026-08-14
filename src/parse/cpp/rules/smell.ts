@@ -950,6 +950,120 @@ function textRule(
 }
 
 /* ------------------------------------------------------------------ *
+ * smell.define_rename_alias — retail placeholder renamed via #define
+ * ------------------------------------------------------------------ */
+
+/**
+ * Configurable placeholder families used to recognize retail symbol names
+ * (SPEC §B). Empty-source patterns (e.g. an adapter declaring `label: ""`)
+ * are treated as absent — `new RegExp("")` would otherwise match every
+ * name (its source is `(?:)`).
+ */
+function activePlaceholderPatterns(patterns: {
+  function?: RegExp;
+  label?: RegExp;
+  data?: RegExp;
+}): RegExp[] {
+  return [patterns.function, patterns.label, patterns.data].filter(
+    (p): p is RegExp => p !== undefined && p.source !== "(?:)",
+  );
+}
+
+/** True when `name` matches at least one of the active placeholder patterns. */
+function matchesPlaceholder(name: string, patterns: RegExp[]): boolean {
+  for (const p of patterns) {
+    p.lastIndex = 0; // defensive: a global pattern must not skip matches
+    if (p.test(name)) return true;
+  }
+  return false;
+}
+
+/**
+ * Normalize a `preproc_arg` replacement body to a plain C identifier, or
+ * null when it is not one. Trailing `//` and block comments are stripped
+ * (tree-sitter includes them in `preproc_arg` text); casts
+ * (`(u32*)0x80000000`), numbers (`42`), and empty bodies are rejected.
+ */
+function replacementIdentifier(arg: SyntaxNode, source: string): string | null {
+  const stripped = nodeText(arg, source)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/\/\/.*$/g, " ")
+    .trim();
+  return /^[A-Za-z_]\w*$/.test(stripped) ? stripped : null;
+}
+
+/**
+ * Names `#undef`-ed anywhere in the file. There is no dedicated
+ * `preproc_undef` node in this grammar — `#undef` is a `preproc_call`
+ * whose `preproc_directive` text is `#undef`.
+ */
+function undefNames(root: SyntaxNode, source: string): Set<string> {
+  const names = new Set<string>();
+  for (const call of descendants(root, "preproc_call")) {
+    const directive = call.namedChildren.find((c) => c.type === "preproc_directive");
+    if (directive === undefined || nodeText(directive, source).trim() !== "#undef") continue;
+    const arg = call.namedChildren.find((c) => c.type === "preproc_arg");
+    if (arg === undefined) continue;
+    const name = nodeText(arg, source)
+      .replace(/\/\*[\s\S]*?\*\//g, " ")
+      .replace(/\/\/.*$/g, " ")
+      .trim();
+    if (name.length > 0) names.add(name);
+  }
+  return names;
+}
+
+/**
+ * SPEC §B: one finding per `preproc_def` whose name matches a placeholder
+ * family (function/label/data) and whose replacement is a plain
+ * non-placeholder identifier — the retail symbol was renamed via a
+ * `#define` alias instead of in the source/symbols. The message is
+ * annotated ` (alias block)` when a matching `#undef` for the same name
+ * exists anywhere in the file. Placeholder→placeholder aliases (incl.
+ * cross-family) and plain `#define`s with no placeholder name are
+ * non-goals. Config-dependent, so it is a factory, not a static entry in
+ * `smellRules`; `lintFile` injects the compiled placeholder patterns.
+ */
+export function makeDefineRenameAliasRule(patterns: {
+  function?: RegExp;
+  label?: RegExp;
+  data?: RegExp;
+}): SourceRule {
+  return {
+    id: "smell.define_rename_alias",
+    description:
+      "retail placeholder (function/label/data) renamed via #define alias",
+    run: (root, source) => {
+      const active = activePlaceholderPatterns(patterns);
+      if (active.length === 0) return [];
+      const undef = undefNames(root, source);
+      const out: Finding[] = [];
+      for (const def of descendants(root, "preproc_def")) {
+        const nameNode = def.namedChildren.find((c) => c.type === "identifier");
+        if (nameNode === undefined) continue;
+        const name = nodeText(nameNode, source);
+        if (!matchesPlaceholder(name, active)) continue;
+        const arg = def.namedChildren.find((c) => c.type === "preproc_arg");
+        if (arg === undefined) continue; // no replacement body
+        const body = replacementIdentifier(arg, source);
+        if (body === null) continue;
+        if (matchesPlaceholder(body, active)) continue; // placeholder→placeholder
+        out.push(
+          findingOf(
+            def,
+            source,
+            "smell.define_rename_alias",
+            `retail symbol '${name}' renamed via #define alias — rename it in the source/symbols instead` +
+              (undef.has(name) ? " (alias block)" : ""),
+          ),
+        );
+      }
+      return out;
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * Registry — SPEC §13.1 order, ids stable.
  * ------------------------------------------------------------------ */
 

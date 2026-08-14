@@ -29,9 +29,12 @@ import type { AgentTurn } from "../pipeline/engine.js";
 import type { Pipeline, Route, Step, StepCtx } from "../pipeline/types.js";
 import type { Selector, WorkItem } from "../types.js";
 import type { WorkflowCompletionStore } from "./completions.js";
+import { makeBuiltinHelpers, makeStartJsonAgent } from "./helpers.js";
+import type { ReadonlyStore, WorkflowHelpers } from "./helpers.js";
 import type {
   RunScope,
   Workflow,
+  WorkflowConfig,
   WorkflowCtx,
   WorkflowDef,
   WorkItemKind,
@@ -94,27 +97,53 @@ export function applyScopeSelector(items: WorkItem[], scope: RunScope | undefine
 export type PlanCtx = StepCtx & { scope?: RunScope };
 
 /**
- * Forward an engine `StepCtx` to a workflow hook as the typed `WorkflowCtx`.
- * The engine hands `agentLoop` hooks the raw StepCtx; the fields it carries
- * (`runtime`, `select`, `log`, `finalize`) are forwarded as-is, and the
- * current `AgentTurn` is merged in for reprompt. `helpers`/`store`/`scope`
- * are completed by the run integration (SPEC §3) — the cast documents the
- * still-incomplete surface so hooks compile against the full contract.
+ * Read-only store view for hooks when the run supplies none — an empty-query
+ * stub that mirrors the codebase's "stub until the daemon wires it" pattern
+ * (`emit` resolves 0, `finalize` no-ops). Hooks always see a DEFINED
+ * `ctx.store` / `helpers.store`; a real store is threaded by the run
+ * integration (a later engine task, alongside `foreach.setup` consumption).
+ */
+const NULL_STORE: ReadonlyStore = { query: async () => [] };
+
+/**
+ * Forward an engine `StepCtx` to a workflow hook as the typed `WorkflowCtx`
+ * (SPEC §3): `ctx.helpers` is MATERIALIZED here — built-in helpers
+ * (`makeBuiltinHelpers(store, select)`) merged with the adapter-wide
+ * `HelperRegistry` (when the run supplies one on the StepCtx) and then the
+ * workflow's local `def.helpers` (local wins, last spread). `ctx.store` is
+ * the run's read-only view (absent = `NULL_STORE`). `ctx.StartJsonAgent` is
+ * bound to the run's runtime, so judge calls go through the same
+ * pacing/budget-wrapped runtime as `agent` turns (SPEC §A.2). The remaining
+ * fields (`runtime`, `select`, `log`, `finalize`) are forwarded as-is; the
+ * current `AgentTurn` is merged in for reprompt. `scope` stays run-supplied
+ * (the engine threads it in a later task; absent = unscoped) — the final
+ * cast documents ONLY that residual hole, not the helpers surface.
  */
 function forwardCtx<K extends WorkItemKind, H extends Record<string, unknown>>(
   ctx: StepCtx,
+  def: WorkflowDef<K, H>,
   lastTurn?: AgentTurn,
 ): WorkflowCtx<K, H> {
-  const base = {
+  const store: ReadonlyStore = ctx.store ?? NULL_STORE;
+  const helpers = {
+    ...makeBuiltinHelpers(store, ctx.select),
+    ...(ctx.helpers === undefined ? {} : ctx.helpers.toObject()),
+    ...(def.helpers ?? {}),
+  } as WorkflowHelpers & H;
+  const forwarded: Omit<WorkflowCtx<K, H>, "scope" | "lastTurn" | "finalize"> & {
+    lastTurn?: AgentTurn;
+    finalize?: WorkflowCtx<K, H>["finalize"];
+  } = {
     runtime: ctx.runtime,
     select: ctx.select,
     log: ctx.log,
-    ...(ctx.finalize !== undefined
-      ? { finalize: ctx.finalize as WorkflowCtx<K, H>["finalize"] }
-      : {}),
+    helpers,
+    store,
+    StartJsonAgent: makeStartJsonAgent(ctx.runtime),
+    ...(ctx.finalize !== undefined ? { finalize: ctx.finalize as WorkflowCtx<K, H>["finalize"] } : {}),
     ...(lastTurn !== undefined ? { lastTurn } : {}),
   };
-  return base as unknown as WorkflowCtx<K, H>;
+  return forwarded as WorkflowCtx<K, H>;
 }
 
 /** Adapt `def.startPrompt` to the engine's `agentLoop.start` surface. */
@@ -122,7 +151,7 @@ function adaptStart<K extends WorkItemKind, H extends Record<string, unknown>>(
   def: WorkflowDef<K, H>,
 ): (targets: WorkItem[], ctx: StepCtx) => Promise<string> {
   return async (targets, ctx) =>
-    def.startPrompt(targets as WorkItemOf<K>[], forwardCtx<K, H>(ctx));
+    def.startPrompt(targets as WorkItemOf<K>[], forwardCtx<K, H>(ctx, def));
 }
 
 /**
@@ -140,7 +169,7 @@ function adaptReprompt<K extends WorkItemKind, H extends Record<string, unknown>
   return async (targets, ctx, lastTurn) => {
     const verdict = await def.reprompt(
       targets as WorkItemOf<K>[],
-      forwardCtx<K, H>(ctx, lastTurn),
+      forwardCtx<K, H>(ctx, def, lastTurn),
       lastTurn,
     );
     return verdict as unknown as {
@@ -150,6 +179,19 @@ function adaptReprompt<K extends WorkItemKind, H extends Record<string, unknown>
       final?: boolean;
     };
   };
+}
+
+/**
+ * Adapt `def.setup` to the compiled `foreach`'s setup surface (SPEC §A.1):
+ * `(targets, ctx) => Promise<WorkflowConfig>`. Absent when the workflow
+ * declares no `setup` (the engine skips the hook then).
+ */
+function adaptSetup<K extends WorkItemKind, H extends Record<string, unknown>>(
+  def: WorkflowDef<K, H>,
+): ((targets: WorkItem[], ctx: StepCtx) => Promise<WorkflowConfig>) | undefined {
+  if (def.setup === undefined) return undefined;
+  return async (targets, ctx) =>
+    def.setup!(targets as WorkItemOf<K>[], forwardCtx<K, H>(ctx, def));
 }
 
 /** Build the `agentLoop` step shared by the main foreach and the fragments. */
@@ -196,8 +238,15 @@ export function compileWorkflow<K extends WorkItemKind, H extends Record<string,
     maxAttempts: r.maxAttempts,
   }));
 
+  // Per-batch config hook, compiled onto the foreach steps (SPEC §A.1). The
+  // ENGINE consumes it in a later task; emitting it now carries `setup`
+  // through the compiled shape so the engine can pick it up unchanged.
+  const setup = adaptSetup(def);
+
   // Fragment per route (SPEC §4 simplification): `when.sizeBelow` → rebatch
   // at the default batch size; routes without it → singleton (batch 1).
+  // Fragments REUSE the compiled loop — and the per-batch `setup` re-runs
+  // inside them (SPEC §A.1 "fragments reuse the compiled loop").
   const fragments = new Map<string, Step[]>();
   for (const [i, route] of (def.routes ?? []).entries()) {
     const rebatch = route.when?.sizeBelow !== undefined;
@@ -206,6 +255,7 @@ export function compileWorkflow<K extends WorkItemKind, H extends Record<string,
         kind: "foreach",
         batch: rebatch ? batch : 1,
         steps: [loop],
+        ...(setup !== undefined ? { setup } : {}),
       },
     ]);
   }
@@ -228,6 +278,7 @@ export function compileWorkflow<K extends WorkItemKind, H extends Record<string,
         kind: "foreach",
         batch,
         steps: [loop],
+        ...(setup !== undefined ? { setup } : {}),
         ...(routes.length > 0 ? { onReject: routes } : {}),
       },
     ],
