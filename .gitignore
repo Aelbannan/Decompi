@@ -4,3 +4,5 @@ dist/
 models.json
 .DS_Store
 *.db
+.decompi/
+build/

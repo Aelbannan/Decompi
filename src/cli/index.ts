@@ -34,7 +34,8 @@ import { deltaRules } from "../parse/cpp/delta.js";
 import { matchContextFromFixture, matchRules } from "../parse/cpp/rules/match.js";
 import type { Finding } from "../parse/cpp/types.js";
 import { loadModels } from "../models/directory.js";
-import type { RunSpec } from "../server/scheduler.js";
+import type { RunSpec, RunRecord } from "../server/scheduler.js";
+import type { LiveStack } from "./live.js";
 import { MockAgentRuntime } from "../agent/mock.js";
 import {
   AnalyzeTools,
@@ -125,11 +126,17 @@ commands:
       List the workflow's status rows (unit | target | status | actor |
       reason | updated_at), or only those of --unit <id> / --target <id>.
   run <wf> [--model <name>] [--budget <micro-usd>] [--target <id>]... [--unit <id>]...
+      [--wait] [--db <path>] [--models <path>]
       Create a run of workflow <wf> (SPEC §6/§7): builds a RunSpec with the
       repeatable --target / --unit scope (AND-ed) and delegates to the
-      Decompi facade's scheduler. Fails with a clear error when the facade is
-      not configured (e.g. inside an embedding harness that calls
-      Decompi.configure first).
+      Decompi facade's scheduler. When the facade is not configured (no
+      embedding harness / serve), the command self-wires a LIVE stack:
+      SQLite store + xenoblade targets import, the basic-match workflow,
+      the real pi SDK agent runtime (models.json in cwd, or --models), and a
+      RunScheduler — so decompi run basic-match --unit <TU> --model <name>
+      runs end-to-end. --wait polls the run until it settles and prints the
+      outcome + workflow status rows (exit 1 when the run failed). --db sets
+      the SQLite path (default ./decompi.db).
   serve [--port <port>] [--db <path>] [--detached]
       M4 control plane (SPEC §15/§16): embedded store daemon + match
       pipelines + run scheduler + bearer-auth REST/WS API + the web/
@@ -1224,17 +1231,24 @@ async function cmdWorkflow(args: readonly string[]): Promise<void> {
 }
 
 /**
- * `run <wf> [--model name] [--budget $] [--target id]... [--unit id]...`
- * (SPEC §6/§7): build the `RunSpec` (scope AND-ed from the repeatable
- * target/unit flags) and delegate to the configured `Decompi` facade. The
- * CLI never configures the facade itself — an embedding harness does — so
- * an unconfigured facade surfaces a clear "no scheduler configured" error.
+ * `run <wf> [--model name] [--budget $] [--target id]... [--unit id]...
+ * [--wait] [--db <path>] [--models <path>]` (SPEC §6/§7): build the `RunSpec`
+ * (scope AND-ed from the repeatable target/unit flags) and delegate to the
+ * configured `Decompi` facade. An unconfigured facade (no embedding harness
+ * / serve) self-wires a LIVE stack via `configureLiveDecompi` — SQLite store
+ * + xenoblade targets import, the `basic-match` workflow, the real pi SDK
+ * agent runtime (models.json), and a RunScheduler — so `decompi run
+ * basic-match --unit <TU> --model <name>` works end-to-end out of the box.
+ * `--wait` polls the run until it settles and prints the outcome + workflow
+ * status rows (exit 1 when the run failed).
  */
 async function cmdRun(args: readonly string[]): Promise<void> {
   const parsed = parseArgs(args);
-  checkFlags(parsed, new Set(["model", "budget", "target", "unit"]));
+  checkFlags(parsed, new Set(["model", "budget", "target", "unit", "wait", "db", "models"]));
   requireValueFlag(parsed, "model");
   requireValueFlag(parsed, "budget");
+  requireValueFlag(parsed, "db");
+  requireValueFlag(parsed, "models");
   if (parsed.positionals.length !== 1) {
     throw new Error("run requires exactly one argument: <workflow-id>");
   }
@@ -1249,6 +1263,7 @@ async function cmdRun(args: readonly string[]): Promise<void> {
     }
     budgetMicroUsd = Number(budgetRaw);
   }
+  const wait = parsed.bools.has("wait");
   // SPEC §6: repeatable --target / --unit, AND-ed into the run scope.
   const scope = {
     targetIds: collectRepeatedValues(args, "target"),
@@ -1260,18 +1275,66 @@ async function cmdRun(args: readonly string[]): Promise<void> {
     ...(budgetMicroUsd !== undefined ? { budgetMicroUsd } : {}),
     scope,
   };
+  // The facade may already be configured (embedding harness / serve): in
+  // that case run on the host's stack. Otherwise self-wire the live stack.
+  let stack: LiveStack | null = null;
+  let runId: string;
   try {
-    const runId = await Decompi.run(spec);
-    process.stdout.write(`run ${runId} created (pipeline ${workflowId}, model ${model})\n`);
+    runId = await Decompi.run(spec);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (/before run\(\)/.test(message)) {
-      throw new Error(
-        "no scheduler configured: Decompi.configure({ engine, scheduler }) must be " +
-          "called before `decompi run` (e.g. by an embedding harness or serve)",
+    if (!/before run\(\)/.test(err instanceof Error ? err.message : String(err))) {
+      throw err;
+    }
+    // Lazy import: `node:sqlite` prints an ExperimentalWarning on load, so
+    // the lint/report hot paths must never pull it in statically.
+    const { configureLiveDecompi } = await import("./live.js");
+    stack = await configureLiveDecompi({
+      ...(parsed.values.get("db") !== undefined
+        ? { dbPath: parsed.values.get("db") }
+        : {}),
+      ...(parsed.values.get("models") !== undefined
+        ? { modelsPath: parsed.values.get("models") }
+        : {}),
+    });
+    runId = await Decompi.run(spec);
+  }
+  process.stdout.write(`run ${runId} created (pipeline ${workflowId}, model ${model})\n`);
+  if (!wait) return;
+  // `stack` is non-null here: the only path that reaches --wait without a
+  // configured facade is the self-wired branch that assigned it.
+  const live = stack!;
+  const { waitForRun } = await import("./live.js");
+  const record = await waitForRun(live.scheduler, runId, {
+    onTick: (r: RunRecord) => {
+      if (r.status !== "queued" && r.status !== "running") return;
+      process.stdout.write(`run ${runId}: ${r.status} (since ${r.startedAt ?? r.createdAt})\n`);
+    },
+  });
+  process.stdout.write(
+    `run ${runId}: ${record.status} (finished ${record.finishedAt ?? "-"})\n`,
+  );
+  if (record.status !== "done") {
+    throw new Error(
+      `run ${runId} did not complete (status ${record.status}) — check events/transcripts for the failure`,
+    );
+  }
+  const { WorkflowStatusStore } = await import("../workflow/status.js");
+  const statuses = new WorkflowStatusStore(live.adapter);
+  const rows = await statuses.list(workflowId);
+  const scoped = rows.filter(
+    (r) =>
+      (scope.unitIds.length === 0 || (r.unitId !== undefined && scope.unitIds.includes(r.unitId))) &&
+      (scope.targetIds.length === 0 || (r.targetId !== undefined && scope.targetIds.includes(r.targetId))),
+  );
+  if (scoped.length === 0) {
+    process.stdout.write(`no workflow status rows for ${workflowId} in the run scope\n`);
+  } else {
+    process.stdout.write(`workflow ${workflowId} — ${scoped.length} status row(s)\n`);
+    for (const row of scoped) {
+      process.stdout.write(
+        `${row.updatedAt}\t${row.unitId || "-"}\t${row.targetId || "-"}\t${row.status}\t${row.actor}\t${row.reason ?? ""}\n`,
       );
     }
-    throw err;
   }
 }
 

@@ -37,7 +37,14 @@
  *     stdout; the caller renders it).
  */
 import { execFile as realExecFile } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -77,6 +84,29 @@ declare module "decompi" {
     runBatchCycle(t: FunctionWorkItem[]): Promise<BatchCycleResult[]>;
     /** Fetch the struct layout for a translation unit (prepass scaffolding). */
     structLayout(unit: string): Promise<string>;
+    /** Read the current source text of a function target's TU. */
+    readSource(t: FunctionWorkItem): Promise<string>;
+    /**
+     * Replace the target function's existing definition in its source file
+     * with `code` (a full function definition, fences/prose stripped).
+     * Returns the new source text. Throws when no existing definition can be
+     * located for the target's symbol.
+     */
+    applyCandidate(t: FunctionWorkItem, code: string): Promise<string>;
+    /** Build+diff one function via hexdiff.py (fresh bytes, holds the repo lock). */
+    hexdiff(unit: string, symbol: string): Promise<string>;
+    /**
+     * The SPEC §9 diff verifier against a FRESH build: hexdiff.py --json
+     * (builds the unit first), accepted iff mismatch_count === 0. Resolves
+     * `{ accepted, mismatch_count, total_instructions, status }` — never
+     * throws on diff failures (a build/read failure resolves rejected).
+     */
+    diffVerify(t: FunctionWorkItem): Promise<{
+      accepted: boolean;
+      mismatch_count: number | null;
+      total_instructions: number | null;
+      status: string | null;
+    }>;
   }
 }
 
@@ -304,15 +334,343 @@ export async function structLayout(unit: string, run: RunFn = defaultRun): Promi
 }
 
 /**
+ * Resolve a target's source file path (absolute): `target.source` is
+ * repo-relative (e.g. "src/kyoshin/CSaveLoad.cpp"); absent → the unit's
+ * conventional `src/<unit>.cpp` path. Verifies the file exists.
+ */
+export function sourcePathFor(t: Pick<FunctionWorkItem, "source" | "unitId" | "symbol" | "id">): string {
+  const { root } = toolPaths();
+  const rel =
+    t.source ??
+    (t.unitId !== undefined && t.symbol !== undefined ? sourceRelFor(t.unitId, t.symbol) : undefined) ??
+    (t.unitId ? `src/${t.unitId}.cpp` : undefined);
+  if (!rel) {
+    throw new Error(`xenoblade workflow helper: no source path for ${t.id} (no source/unitId)`);
+  }
+  const abs = join(root, rel);
+  if (!existsSync(abs)) {
+    throw new Error(`xenoblade workflow helper: source file not found at ${abs}`);
+  }
+  return abs;
+}
+
+// ── targets.json source lookup (for tools that only know unit+symbol) ─────
+
+interface SourceIndex {
+  key: string;
+  byUnitSymbol: Map<string, string>;
+}
+let sourceIndex: SourceIndex | null = null;
+
+/**
+ * Resolve the repo-relative source path of a target from the live
+ * tools/coop/targets.json registry (cached module-level, keyed by
+ * path:mtimeMs:size — the same cache discipline as the adapter's import).
+ * Returns undefined when the registry is unreadable or the target is absent.
+ */
+export function sourceRelFor(unit: string, symbol: string): string | undefined {
+  const root = resolveXenobladeRoot();
+  const path = join(root, "tools", "coop", "targets.json");
+  let stat: ReturnType<typeof statSync>;
+  try {
+    stat = statSync(path);
+  } catch {
+    return undefined;
+  }
+  const key = `${path}:${stat.mtimeMs}:${stat.size}`;
+  if (sourceIndex === null || sourceIndex.key !== key) {
+    let doc: { targets?: Array<{ unit?: unknown; symbol?: unknown; source?: unknown }> };
+    try {
+      doc = JSON.parse(readFileSync(path, "utf8")) as typeof doc;
+    } catch {
+      return undefined;
+    }
+    const byUnitSymbol = new Map<string, string>();
+    for (const t of doc.targets ?? []) {
+      if (
+        typeof t.unit === "string" &&
+        typeof t.symbol === "string" &&
+        typeof t.source === "string"
+      ) {
+        byUnitSymbol.set(`${t.unit}\u0000${t.symbol}`, t.source);
+      }
+    }
+    sourceIndex = { key, byUnitSymbol };
+  }
+  return sourceIndex.byUnitSymbol.get(`${unit}\u0000${symbol}`);
+}
+
+/**
+ * Read the current source text of a function target's TU (the whole file).
+ */
+export async function readSource(t: FunctionWorkItem): Promise<string> {
+  return readFileSync(sourcePathFor(t), "utf8");
+}
+
+/** Escape a string for use in a RegExp. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Candidate name tokens for locating a function's definition in source:
+ * the exact symbol first, then the demangled stem (everything before the
+ * first `__` — e.g. `detail_CanPlaySound__Q44nw4r…` → `detail_CanPlaySound`,
+ * which is what the source actually spells as `Class::detail_CanPlaySound`).
+ */
+function symbolStems(symbol: string): string[] {
+  const stems: string[] = [symbol];
+  const idx = symbol.indexOf("__");
+  if (idx > 0) stems.push(symbol.slice(0, idx));
+  return [...new Set(stems)];
+}
+
+/**
+ * Locate the source span of the definition of `symbol` in `source`:
+ * from the start of the declaration line (walking back over prefix lines
+ * such as `extern "C"` / return-type continuations) through the end of the
+ * brace-matched body. Returns `{start, end}` or null when no definition is
+ * found (the symbol may only appear as a call site / declaration). The LAST
+ * matching definition wins (stubs typically sit at the end of the file).
+ */
+export function extractFunctionSpan(
+  source: string,
+  symbol: string,
+): { start: number; end: number } | null {
+  for (const stem of symbolStems(symbol)) {
+    const re = new RegExp(`(?:^|[^\\w])(${escapeRegExp(stem)})\\s*\\(`, "g");
+    const candidates: Array<{ start: number; end: number }> = [];
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(source)) !== null) {
+      const namePos = m.index + m[0].indexOf(stem);
+      // Scan for the body open brace at paren depth 0; a `;` at depth 0
+      // before any `{` means a call/declaration, not a definition.
+      let depth = 0;
+      let open = -1;
+      for (let i = namePos + stem.length; i < source.length; i++) {
+        const c = source[i];
+        if (c === "(") depth++;
+        else if (c === ")") depth--;
+        else if (c === "{" && depth === 0) {
+          open = i;
+          break;
+        } else if (c === ";" && depth === 0) break;
+      }
+      if (open < 0) continue;
+      let d = 0;
+      let close = -1;
+      for (let j = open; j < source.length; j++) {
+        if (source[j] === "{") d++;
+        else if (source[j] === "}") {
+          d--;
+          if (d === 0) {
+            close = j;
+            break;
+          }
+        }
+      }
+      if (close < 0) continue;
+      // Definition start: the line containing the name, then walk back over
+      // prefix lines (return type / `extern "C"` / multiline signature)
+      // that don't terminate a previous statement.
+      let start = source.lastIndexOf("\n", namePos) + 1;
+      let prev = source.lastIndexOf("\n", start - 2);
+      while (prev >= 0) {
+        const prevLine = source.slice(prev + 1, start).trim();
+        if (
+          prevLine.length === 0 ||
+          /[;}{]$/.test(prevLine) ||
+          prevLine.startsWith("//") ||
+          prevLine.startsWith("/*")
+        ) {
+          break;
+        }
+        start = prev + 1;
+        prev = source.lastIndexOf("\n", start - 2);
+      }
+      candidates.push({ start, end: close + 1 });
+    }
+    if (candidates.length > 0) {
+      candidates.sort((a, b) => b.start - a.start);
+      return candidates[0]!;
+    }
+  }
+  return null;
+}
+
+/** Strip markdown fences (and any leading prose up to the first fence). */
+export function stripCodeFences(code: string): string {
+  let out = code.trim();
+  // If the reply wraps the code in fences, keep only the fenced block(s).
+  const fenced = /```[a-zA-Z0-9_+-]*\n([\s\S]*?)```/g.exec(out);
+  if (fenced) out = fenced[1]!.trim();
+  return out;
+}
+
+/**
+ * Validate a candidate before splicing it into the source. Models
+ * occasionally paste verification output (a "PASS — matches retail exactly"
+ * status line) as if it were code, which corrupts the TU and wastes the
+ * turn. Rejects candidates that (a) contain verification-speak or HTML
+ * entities, (b) never name the target symbol, or (c) have no brace-balanced
+ * body. Returns the normalized candidate on success.
+ */
+export function validateCandidate(code: string, symbol: string): string {
+  const candidate = stripCodeFences(code);
+  if (candidate.length === 0) {
+    throw new Error(`candidate for ${symbol} is empty`);
+  }
+  const stem = symbolStems(symbol)[0]!;
+  if (
+    /matches retail exactly|&#\d+;|^\s*PASS\b|^\s*FAIL\b/m.test(candidate)
+  ) {
+    throw new Error(
+      `candidate for ${symbol} looks like verification output, not code ` +
+        `(contains a PASS/FAIL/status line). Resubmit ONLY the function definition.`,
+    );
+  }
+  const firstBrace = candidate.indexOf("{");
+  if (firstBrace < 0) {
+    throw new Error(`candidate for ${symbol} has no function body "{"`);
+  }
+  if (!candidate.slice(0, firstBrace).includes(stem)) {
+    throw new Error(`candidate for ${symbol} does not name ${stem}`);
+  }
+  let depth = 0;
+  for (const ch of candidate) {
+    if (ch === "{") depth++;
+    else if (ch === "}") depth--;
+    if (depth < 0) {
+      throw new Error(`candidate for ${symbol} has unbalanced braces`);
+    }
+  }
+  if (depth !== 0) {
+    throw new Error(`candidate for ${symbol} has unbalanced braces`);
+  }
+  return candidate;
+}
+
+/**
+ * Apply a candidate implementation to a function target's source file:
+ * `code` is the model's proposed full definition (fences/prose stripped,
+ * markdown fences removed); the target's EXISTING definition span is located
+ * via {@link extractFunctionSpan} and replaced in place. An `extern "C"`
+ * prefix on the original definition is preserved when the candidate omits it
+ * (dropping it would mangle the symbol and break the build). The file is
+ * written back to the worktree and the new source text is returned. Throws
+ * when no existing definition can be located.
+ */
+export async function applyCandidate(
+  t: FunctionWorkItem,
+  code: string,
+): Promise<string> {
+  const path = sourcePathFor(t);
+  const source = readFileSync(path, "utf8");
+  const symbol = t.symbol;
+  if (!symbol) {
+    throw new Error(`xenoblade workflow helper applyCandidate: no symbol for ${t.id}`);
+  }
+  const span = extractFunctionSpan(source, symbol);
+  if (span === null) {
+    throw new Error(
+      `xenoblade workflow helper applyCandidate: no existing definition found for ` +
+        `${symbol} in ${path} — the model's output must replace an existing stub ` +
+        `(calls/declarations alone are not spliced)`,
+    );
+  }
+  const original = source.slice(span.start, span.end);
+  let replacement = validateCandidate(code, symbol);
+  // Preserve an extern "C" linkage prefix the original had (the candidate
+  // may not know the TU is C++).
+  const prefix = /^\s*(extern\s+"C"\s+)/.exec(original);
+  if (prefix && !/^\s*extern\s+"C"/.test(replacement)) {
+    replacement = `${prefix[1]}${replacement.trimStart()}`;
+  }
+  const updated = source.slice(0, span.start) + replacement + source.slice(span.end);
+  writeFileSync(path, updated);
+  return updated;
+}
+
+/**
+ * Build+diff one function via the coop hexdiff tool (NO `--no-build`: the
+ * tool runs ninja for the unit under the repo-wide build lock, so the diff
+ * reflects the freshly-edited source). On a build/compile failure the
+ * underlying ninja/mwcceppc stderr is RETURNED (not thrown) — a compile
+ * error is the model's most valuable feedback, and throwing would surface
+ * only the command echo.
+ */
+export async function hexdiff(
+  unit: string,
+  symbol: string,
+  run: RunFn = defaultRun,
+): Promise<string> {
+  const { python, hexdiff: script } = toolPaths();
+  try {
+    return await run(python, [script, unit, "--symbol", symbol]);
+  } catch (err) {
+    const e = err as { stderr?: string; stdout?: string; message?: string };
+    const stderr = (e.stderr ?? "").trim();
+    const stdout = (e.stdout ?? "").trim();
+    // hexdiff exits non-zero (rc 5) on MISMATCH while printing the full diff
+    // to stdout — that diff is the model's primary feedback, never discard it.
+    if (stdout.length > 0) return stdout;
+    return `hexdiff FAILED (exit non-zero):\n${stderr || (e.message ?? String(err))}`;
+  }
+}
+
+/**
+ * The SPEC §9 diff verifier against a FRESH build: hexdiff.py --json with a
+ * build (the coop tool runs ninja for the unit under the repo-wide build
+ * lock, so the diff reflects the freshly-edited source). Accepted iff
+ * `mismatch_count === 0`. Diff/build failures never throw — the verdict is
+ * rejected with the mismatch fields nulled.
+ */
+export async function diffVerify(
+  t: FunctionWorkItem,
+  run: RunFn = defaultRun,
+): Promise<{ accepted: boolean; mismatch_count: number | null; total_instructions: number | null; status: string | null }> {
+  if (!t.unitId || !t.symbol) {
+    return { accepted: false, mismatch_count: null, total_instructions: null, status: "NO_SYMBOL" };
+  }
+  const { python, hexdiff: script } = toolPaths();
+  let stdout = "";
+  try {
+    stdout = await run(python, [script, t.unitId, "--symbol", t.symbol, "--json"]);
+  } catch {
+    return { accepted: false, mismatch_count: null, total_instructions: null, status: "BUILD_OR_DIFF_FAILED" };
+  }
+  try {
+    const doc = JSON.parse(stdout) as {
+      mismatch_count?: unknown;
+      total_instructions?: unknown;
+    };
+    const mismatch = typeof doc.mismatch_count === "number" ? doc.mismatch_count : null;
+    const total = typeof doc.total_instructions === "number" ? doc.total_instructions : null;
+    return {
+      accepted: mismatch === 0,
+      mismatch_count: mismatch,
+      total_instructions: total,
+      status: mismatch === 0 ? "FULL_MATCH" : null,
+    };
+  } catch {
+    return { accepted: false, mismatch_count: null, total_instructions: null, status: "UNPARSEABLE" };
+  }
+}
+
+/**
  * Register the xenoblade workflow helpers into a `HelperRegistry` (the
- * facade's registry — `Decompi.helpers` — or the engine's). All three are
- * the real coop-tool wrappers; the injected-`run` parameters are optional
- * and left untouched by the registry.
+ * facade's registry — `Decompi.helpers` — or the engine's). All seven are the
+ * real coop-tool wrappers; the injected-`run` parameters are optional and
+ * left untouched by the registry.
  */
 export function registerHelpers(registry: HelperRegistry): void {
   registry.register("getFunctionAsm", getFunctionAsm);
   registry.register("runBatchCycle", runBatchCycle);
   registry.register("structLayout", structLayout);
+  registry.register("readSource", readSource);
+  registry.register("applyCandidate", applyCandidate);
+  registry.register("hexdiff", hexdiff);
+  registry.register("diffVerify", diffVerify);
 }
 
 // ── Agent tools (SPEC §B.1 adapter tools) ─────────────────────────────────

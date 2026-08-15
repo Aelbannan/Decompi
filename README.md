@@ -194,8 +194,9 @@ decompi run <workflow> [--model name] [--budget $] [--target id]... [--unit id].
 decompi select '<selector-json>' [--json]
 decompi status [--unit U] [--selector …]
 decompi diff <unit> [--symbol S] [--all] [--list] [--brief] [--asm] [--no-build] [--json]   # hexdiff alias
-decompi lint <paths…> [--delta] [--json]
-decompi report [--check] [--json]
+decompi lint <paths…> [--delta] [--json|--markdown] [--rule <id>] [--no-fail]
+       [--config <path>] [--fixture <path>]
+decompi report [paths…] [--json] | --write | --check [--base <ref>] [--no-strict] [--variant RVL] [--json]
 decompi export registry|work-items|events|spans   | decompi import <snapshot>
 decompi workflow set <wf> <status> --unit U | --target T   | decompi workflow status <wf>
 decompi models list | validate
@@ -207,6 +208,83 @@ decompi prune [--retention-days N]
 (Adapter maintenance commands — `recertify`, `sync`, `scan-source`, `reloc-map`,
 `size`, `progress`, `ctx`, `triage` — are declared by the adapter and surfaced
 when present.)
+
+### Linting — `decompi lint`
+
+Whole-file scan with the source rules (`smell.*`, `ptr.*`, `clone.*`, plus the
+`match.*` rules when `--fixture` provides accepted work items). Directories are
+walked for source files (`.cpp/.cc/.cxx/.c`; headers too); explicit files are
+linted regardless of extension.
+
+```
+$ decompi lint src/a.cpp src/b.cpp
+smell.void_ptr: 2
+  src/a.cpp:4:3  void* p
+  src/a.cpp:8:5  void* q
+smell.class_in_cpp: 1
+  src/b.cpp:2:1  class Foo { int x; }
+$ echo $?
+1
+```
+
+No findings prints `clean: no findings in N file(s)` and exits **0**; any
+finding exits **1** (the CI gate). `--no-fail` forces exit 0.
+
+- `--delta` — lint only added lines against `<path>.orig`; without a `.orig`
+  the whole file is treated as added.
+- `--rule <id>` — emit only findings of that rule id (`smell.void_ptr`,
+  `no_angle_include`, …); unknown ids warn on stderr.
+- `--json` — one JSON array of `{rule, line, column, snippet, message, path}`
+  (all files in a single document; `column`/`snippet` are null when absent):
+
+  ```json
+  [ { "rule": "smell.void_ptr", "line": 4, "column": 3,
+      "snippet": "void* p", "message": "…", "path": "src/a.cpp" } ]
+  ```
+
+- `--markdown` — per-file report table (`## path` + rule/line/column/snippet/
+  message columns).
+- `--config <path>` — JSON `LintConfig` (placeholder patterns as regex
+  strings); `--fixture <path>` — JSON fixture of accepted work items.
+- `--help` — full option reference.
+
+### Smell report — `decompi report`
+
+Per-rule / per-file finding counts over the game-code roots (`src/kyoshin`,
+`libs/monolib/src`, `libs/nw4r/src`), or over explicit paths:
+
+```
+$ decompi report src/a.cpp
+by rule:
+  smell.void_ptr                          2
+by file:
+  src/a.cpp                               2
+total findings: 2
+$ decompi report --json      # { "rules": {…}, "files": {…}, "total": n }
+```
+
+CI gate (mirror of `tools/coop/smell_report.py`):
+
+- `decompi report --write` — regenerate the committed `docs/smells.md`
+  (baseline included).
+- `decompi report --check` — exit **1** when `docs/smells.md` is stale (≠ a
+  fresh regeneration) or a per-TU metric regressed vs the base-branch
+  baseline (`git show <ref>:docs/smells.md`; default `origin/main` →
+  `HEAD~1`). `--no-strict` skips the regression check; `--base <ref>` picks
+  the baseline ref; `--variant RVL` scans `libs/RVL_SDK/src` with asm bodies
+  stripped (informational); `--json` emits the `{ok, problems}` verdict
+  instead of prose.
+- `decompi report --completeness` — live TU status table from the work-item
+  registry.
+
+Typical CI wiring:
+
+```
+decompi lint --json src/ | jq -e 'length == 0'        # block on findings
+decompi report --write                                # refresh baseline
+… commit docs/smells.md …
+decompi report --check                                # freshness + regression gate
+```
 
 ---
 
