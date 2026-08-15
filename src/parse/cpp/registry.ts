@@ -160,43 +160,55 @@ export function lintDelta(
   return deltaLintDelta(path, oldText, newText, options);
 }
 
-/** Grep-style one-line-per-finding rendering. */
-function formatText(findings: Finding[]): string {
-  return findings
-    .map((f) => {
-      const loc = f.column !== undefined ? `${f.line}:${f.column}` : `${f.line}`;
-      const snip = f.snippet !== undefined && f.snippet.length > 0 ? `  (${f.snippet})` : "";
-      return `${loc}  ${f.rule}  ${f.message}${snip}`;
-    })
-    .join("\n");
+/** Escape a markdown table cell (pipes + backticks inside code). */
+function mdCell(text: string): string {
+  return text.replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/`/g, "\\`");
 }
 
-/** Markdown report grouped by rule id. */
-function formatMarkdown(findings: Finding[]): string {
-  if (findings.length === 0) return "No findings.";
+/**
+ * Human-readable rendering grouped by rule id — `rule: count` header, then
+ * `line:col  snippet` (message when the finding carries no snippet). Empty
+ * findings render as an empty string (the CLI prints its own "clean" line).
+ */
+function formatText(findings: Finding[]): string {
+  if (findings.length === 0) return "";
   const byRule = new Map<string, Finding[]>();
   for (const f of findings) {
     const group = byRule.get(f.rule);
     if (group === undefined) byRule.set(f.rule, [f]);
     else group.push(f);
   }
-  const parts: string[] = [];
+  const lines: string[] = [];
   for (const [rule, group] of byRule) {
-    parts.push(`### ${rule}`, "");
+    lines.push(`${rule}: ${group.length}`);
     for (const f of group) {
-      const loc = f.column !== undefined ? `line ${f.line}:${f.column}` : `line ${f.line}`;
-      const snip = f.snippet !== undefined && f.snippet.length > 0 ? ` — \`${f.snippet}\`` : "";
-      parts.push(`- ${loc}: ${f.message}${snip}`);
+      const loc = f.column !== undefined ? `${f.line}:${f.column}` : `${f.line}`;
+      const detail = f.snippet !== undefined && f.snippet.length > 0 ? f.snippet : f.message;
+      lines.push(`  ${loc}  ${detail}`);
     }
-    parts.push("");
   }
-  return parts.join("\n").trimEnd();
+  return lines.join("\n");
+}
+
+/** Markdown report table (rule | line | column | snippet | message). */
+function formatMarkdown(findings: Finding[]): string {
+  if (findings.length === 0) return "No findings.";
+  const rows = findings.map((f) => {
+    const col = f.column !== undefined ? String(f.column) : "";
+    const snip = f.snippet !== undefined && f.snippet.length > 0 ? `\`${mdCell(f.snippet)}\`` : "";
+    return `| ${mdCell(f.rule)} | ${f.line} | ${col} | ${snip} | ${mdCell(f.message)} |`;
+  });
+  return [
+    "| rule | line | column | snippet | message |",
+    "|---|---|---|---|---|",
+    ...rows,
+  ].join("\n");
 }
 
 /**
- * Render findings (SPEC §13.4): `text` (grep-style lines, empty when none),
- * `json` (stable schema — a JSON array of `Finding` objects), or `markdown`
- * (per-rule report).
+ * Render findings (SPEC §13.4): `text` (grouped by rule — `rule: count`
+ * headers with `line:col  snippet` rows, empty when none), `json` (stable
+ * schema — a JSON array of `Finding` objects), or `markdown` (report table).
  */
 export function formatFindings(findings: Finding[], fmt: "text" | "json" | "markdown"): string {
   switch (fmt) {
@@ -307,8 +319,12 @@ function asmBodyLines(
   return { entry, body };
 }
 
-/** Recursively collect source files under a root (dir walk or single file). */
-function collectSourceFiles(paths: string[], includeC: boolean): string[] {
+/**
+ * Recursively collect source files under a root (dir walk or single file).
+ * Missing/unreadable entries are skipped (deterministic); directories are
+ * walked for `.cpp` (+ `.c` with `includeC`, excluding `.ctx.c`).
+ */
+export function collectSourceFiles(paths: string[], includeC: boolean): string[] {
   const out: string[] = [];
   const isTarget = (name: string): boolean =>
     /\.cpp$/.test(name) || (includeC && /\.c$/.test(name) && !/\.ctx\.c$/.test(name));

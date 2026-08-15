@@ -105,13 +105,19 @@ test("formatFindings json is parseable and round-trips; text/markdown render", (
   const json = formatFindings(findings, "json");
   assert.deepEqual(JSON.parse(json), findings);
 
+  // Text is grouped by rule: `rule: count` header, then `line:col  snippet`
+  // (message when the finding has no snippet).
   const text = formatFindings(findings, "text");
-  assert.match(text, /4:3\s+smell\.void_ptr\s+untyped pointer/);
-  assert.match(text, /7\s+smell\.ptr_arith/);
+  assert.match(text, /smell\.void_ptr: 1/);
+  assert.match(text, /4:3\s+void\* p/);
+  assert.match(text, /smell\.ptr_arith: 1/);
+  assert.match(text, /7\s+manual field access/);
   assert.equal(formatFindings([], "text"), "");
 
+  // Markdown is a report table with the six-column header.
   const md = formatFindings(findings, "markdown");
-  assert.match(md, /### smell\.void_ptr/);
-  assert.match(md, /line 4:3/);
+  assert.match(md, /\| rule \| line \| column \| snippet \| message \|/);
+  assert.match(md, /\| smell\.void_ptr \| 4 \| 3 \| `void\* p` \| untyped pointer \|/);
+  assert.match(md, /\| smell\.ptr_arith \| 7 \|  \|  \| manual field access \|/);
   assert.match(formatFindings([], "markdown"), /No findings/);
 });

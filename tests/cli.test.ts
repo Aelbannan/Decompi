@@ -326,7 +326,7 @@ test("parseArgs: boolean flags never consume the next token and reject =values",
   assert.equal(base.values.get("variant"), "RVL");
 });
 
-test("lint --json emits ONE valid JSON document for multiple files", async () => {
+test("lint --json emits ONE flat JSON array with the stable finding schema", async () => {
   const dir = mkdtempSync(join(tmpdir(), "decompi-lint-json-"));
   try {
     const a = join(dir, "a.cpp");
@@ -337,10 +337,19 @@ test("lint --json emits ONE valid JSON document for multiple files", async () =>
     await runLint([a, b], { format: "json" }, c.out);
     const parsed = JSON.parse(c.text());
     assert.ok(Array.isArray(parsed), "expected a single JSON array document");
-    assert.equal(parsed.length, 2);
-    assert.deepEqual(parsed.map((r) => r.path), [a, b]);
-    const voidPtr = parsed.find((r) => r.path === a).findings.find((f) => f.rule === "smell.void_ptr");
+    assert.equal(new Set(parsed.map((r) => r.path)).size, 2, "both files must appear");
+    // Stable schema: every entry carries rule/line/column/snippet/message/path.
+    for (const entry of parsed) {
+      for (const key of ["rule", "line", "column", "snippet", "message", "path"]) {
+        assert.ok(key in entry, `missing schema key "${key}"`);
+      }
+    }
+    const voidPtr = parsed.find((r) => r.rule === "smell.void_ptr");
     assert.ok(voidPtr, "a.cpp should carry a smell.void_ptr finding");
+    assert.equal(voidPtr.path, a);
+    assert.equal(voidPtr.line, 1);
+    const cls = parsed.find((r) => r.path === b);
+    assert.equal(cls.rule, "smell.class_in_cpp");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

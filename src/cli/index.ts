@@ -5,29 +5,35 @@
  * logic is fully testable in-process: `runStatus` / `runSelect` / `runLint` /
  * `runReport` are exported and `main(argv)` only wires argv → those functions.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { SqlAdapter } from "../core/store/adapter.js";
 import type { Selector } from "../types.js";
-import { SqliteAdapter } from "../core/store/sqlite.js";
+// SqliteAdapter is a type-only import here: `node:sqlite` is an experimental
+// module whose load prints an ExperimentalWarning to stderr, so it is only
+// loaded (via openAndImport / cmdServe dynamic imports) by commands that
+// actually touch the store — `lint` / `report` stay warning-free for CI.
+import type { SqliteAdapter } from "../core/store/sqlite.js";
 import { FixtureAdapter } from "../adapter/fixture.js";
 import { validateSelector } from "../target/selector.js";
 import { WorkItemRepo } from "../target/work-item.js";
 import { exportRegistry, importRegistry, type RegistrySnapshot } from "../target/registry.js";
 import {
   checkSmellReport,
+  collectSourceFiles,
   formatFindings,
   lintDelta,
   lintFile,
   renderSmellReport,
   scanUnits,
+  sourceRules,
   type LintConfig,
 } from "../parse/cpp/registry.js";
-import { matchContextFromFixture } from "../parse/cpp/rules/match.js";
+import { deltaRules } from "../parse/cpp/delta.js";
+import { matchContextFromFixture, matchRules } from "../parse/cpp/rules/match.js";
 import type { Finding } from "../parse/cpp/types.js";
 import { loadModels } from "../models/directory.js";
-import { startServer } from "../server/serve.js";
 import type { RunSpec } from "../server/scheduler.js";
 import { MockAgentRuntime } from "../agent/mock.js";
 import {
@@ -66,21 +72,32 @@ commands:
   select '<selector-json>' [--db <path>] [--fixture <path>]
       Run a JSON Selector (src/types.ts) and print matching rows
       (id, symbol, status, size — one per line).
-  lint <paths…> [--delta] [--json|--markdown] [--config <path>] [--fixture <path>]
+  lint <paths…> [--delta] [--json|--markdown] [--rule <id>] [--no-fail]
+       [--config <path>] [--fixture <path>]
       Whole-file scan with the source rules (smell.* + ptr.* + clone.*, plus
-      the match.* rules when --fixture provides accepted work items). With
-      --delta, lint only the added lines against <path>.orig (whole file when
-      no .orig exists). --config loads a JSON LintConfig (placeholder patterns
-      given as regex strings). --json emits one JSON array document.
+      the match.* rules when --fixture provides accepted work items).
+      Directories are walked for source files. Text output groups findings by
+      rule (rule → count → path:line:col snippet) and prints "clean" with exit
+      0 when nothing is found. Exit 1 when any finding is emitted (CI gate;
+      --no-fail forces exit 0). --delta lints only the added lines against
+      <path>.orig (whole file when no .orig exists). --rule <id> emits only
+      findings of that rule id. --config loads a JSON LintConfig (placeholder
+      patterns given as regex strings). --json emits ONE JSON array of
+      {rule,line,column,snippet,message,path}; --markdown emits a per-file
+      report table.
   report [paths…] [--json] [--config <path>]
-      Whole-file scan summary: per-rule counts, then per-file counts.
+      Whole-file scan summary: per-rule counts, then per-file counts, then the
+      total (paths default to the game-code roots: src/kyoshin,
+      libs/monolib/src, libs/nw4r/src). --json emits a machine-readable
+      {rules, files, total} object.
       CI gate (mirror of tools/coop/smell_report.py):
-        report --check [--base <ref>] [--no-strict] [--variant RVL]
+        report --check [--base <ref>] [--no-strict] [--variant RVL] [--json]
             Freshness (committed docs/smells.md == fresh regeneration) + per-TU
             regression vs the base branch's committed baseline (git show
-            <ref>:docs/smells.md; default origin/main → HEAD~1). --variant RVL
-            scans libs/RVL_SDK/src with asm bodies stripped (informational,
-            freshness-only).
+            <ref>:docs/smells.md; default origin/main → HEAD~1). Exits 1 when
+            stale or regressed; --json emits the {ok, problems} verdict.
+            --variant RVL scans libs/RVL_SDK/src with asm bodies stripped
+            (informational, freshness-only).
         report --write [--variant RVL]
             Regenerate the committed report (docs/smells.md).
         report --completeness [--db <path>] [--fixture <path>]
@@ -154,6 +171,7 @@ export const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
   "no-strict",
   "completeness",
   "detached",
+  "no-fail",
 ]);
 
 /**
@@ -433,43 +451,144 @@ export interface LintRunOptions {
   delta?: boolean;
   /** Output format (`--json` → "json", `--markdown` → "markdown"; default "text"). */
   format?: "text" | "json" | "markdown";
+  /** `--rule <id>`: emit only findings of this rule id. */
+  rule?: string;
   config?: LintConfig;
 }
 
 /**
+ * Source extensions picked up when a `lint` positional is a directory.
+ * Explicit file paths are linted regardless of extension.
+ */
+const LINT_SOURCE_RE = /\.(?:cpp|cc|cxx|c|hpp|hh|hxx|h)$/i;
+
+/**
+ * Expand `lint` positionals: explicit files pass through, directories are
+ * walked recursively for source files (dotfiles skipped, deterministic sort).
+ * Missing paths are left for `readSource` to error on with a clear message.
+ */
+function expandLintPaths(paths: readonly string[]): string[] {
+  const out: string[] = [];
+  const walkDir = (p: string): void => {
+    let entries: string[];
+    try {
+      entries = readdirSync(p);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.startsWith(".")) continue;
+      const child = join(p, entry);
+      let childSt;
+      try {
+        childSt = statSync(child);
+      } catch {
+        continue;
+      }
+      if (childSt.isDirectory()) walkDir(child);
+      else if (childSt.isFile() && LINT_SOURCE_RE.test(entry)) out.push(child);
+    }
+  };
+  for (const p of paths) {
+    let st;
+    try {
+      st = statSync(p);
+    } catch {
+      out.push(p); // missing explicit path → readSource reports it with a clear error
+      continue;
+    }
+    if (st.isFile()) out.push(p);
+    else if (st.isDirectory()) walkDir(p);
+  }
+  return [...new Set(out)].sort();
+}
+
+/**
  * Whole-file scan per path (`lintFile`), or the added-lines delta gate
- * (`lintDelta`) with `--delta`. Text output is grep-style
- * `path:line:col rule message`; `--json` emits ONE valid JSON document — an
- * array `[{ "path", "findings" }, …]` (SPEC §13.4 stable schema) — so a
- * multi-file scan pipes cleanly; `--markdown` emits a per-file rule-grouped
- * report.
+ * (`lintDelta`) with `--delta`. Directories are walked; `--rule <id>` filters
+ * to one rule. Returns the number of findings emitted (the CLI maps a
+ * non-zero count to exit code 1 unless `--no-fail`).
+ *
+ * Text output is grouped by rule — `rule: count` headers with
+ * `path:line:col  snippet` rows — and prints a `clean:` line when nothing was
+ * found. `--json` emits ONE valid JSON document: a flat array of
+ * `{rule, line, column, snippet, message, path}` (column/snippet are null when
+ * absent), so a multi-file scan pipes cleanly. `--markdown` emits a per-file
+ * report table (`## path` + rule/line/column/snippet/message columns).
  */
 export async function runLint(
   paths: readonly string[],
   opts: LintRunOptions = {},
   out: Output = process.stdout,
-): Promise<void> {
+): Promise<number> {
+  const expanded = expandLintPaths(paths);
+  const rule = opts.rule;
   const results: Array<{ path: string; findings: Finding[] }> = [];
-  for (const path of paths) {
+  let total = 0;
+  for (const path of expanded) {
     const source = readSource(path);
-    const findings: Finding[] =
-      opts.delta === true
-        ? lintDelta(path, readOrig(path), source, opts.config)
-        : lintFile(path, source, opts.config);
-    if (opts.format === "json") {
-      results.push({ path, findings });
-    } else if (opts.format === "markdown") {
+    const findings: Finding[] = (opts.delta === true
+      ? lintDelta(path, readOrig(path), source, opts.config)
+      : lintFile(path, source, opts.config)
+    ).filter((f) => rule === undefined || f.rule === rule);
+    total += findings.length;
+    results.push({ path, findings });
+  }
+  const fmt = opts.format ?? "text";
+  if (fmt === "json") {
+    out.write(
+      JSON.stringify(
+        results.flatMap(({ path, findings }) =>
+          findings.map((f) => ({
+            rule: f.rule,
+            line: f.line,
+            column: f.column ?? null,
+            snippet: f.snippet ?? null,
+            message: f.message,
+            path,
+          })),
+        ),
+        null,
+        2,
+      ) + "\n",
+    );
+    return total;
+  }
+  if (fmt === "markdown") {
+    if (total === 0) {
+      out.write("No findings.\n");
+      return total;
+    }
+    for (const { path, findings } of results) {
+      if (findings.length === 0) continue;
       out.write(`## ${path}\n\n`);
       out.write(formatFindings(findings, "markdown") + "\n\n");
-    } else {
-      for (const line of formatFindings(findings, "text").split("\n")) {
-        if (line.length > 0) out.write(`${path}:${line}\n`);
-      }
+    }
+    return total;
+  }
+  if (total === 0) {
+    out.write(`clean: no findings in ${results.length} file(s)\n`);
+    return total;
+  }
+  // Text: grouped by rule across all files (rule → count → path:line:col snippet).
+  const groups = new Map<string, Array<{ path: string; f: Finding }>>();
+  for (const { path, findings } of results) {
+    for (const f of findings) {
+      const group = groups.get(f.rule);
+      if (group === undefined) groups.set(f.rule, [{ path, f }]);
+      else group.push({ path, f });
     }
   }
-  if (opts.format === "json") {
-    out.write(JSON.stringify(results, null, 2) + "\n");
+  for (const ruleId of [...groups.keys()].sort()) {
+    const group = groups.get(ruleId)!;
+    out.write(`${ruleId}: ${group.length}\n`);
+    for (const { path, f } of group) {
+      const loc = f.column !== undefined ? `${f.line}:${f.column}` : `${f.line}`;
+      const detail = f.snippet !== undefined && f.snippet.length > 0 ? f.snippet : f.message;
+      out.write(`  ${path}:${loc}  ${detail}\n`);
+    }
   }
+  return total;
 }
 
 export interface ReportRunOptions {
@@ -478,9 +597,38 @@ export interface ReportRunOptions {
 }
 
 /**
+ * Expand `report` positionals: explicit files pass through, directories are
+ * walked with TU semantics (`.cpp`, mirroring the gate), and no paths defaults
+ * to `DEFAULT_ROOTS`. Explicit missing paths error clearly; default roots that
+ * do not exist on another repo are skipped silently (like `scanUnits`).
+ */
+function expandReportPaths(paths: readonly string[]): string[] {
+  const explicit = paths.length > 0;
+  const roots = explicit ? [...paths] : [...DEFAULT_ROOTS];
+  const out = new Set<string>();
+  for (const p of roots) {
+    let st;
+    try {
+      st = statSync(p);
+    } catch (err) {
+      if (explicit) {
+        throw new Error(`cannot read ${p}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      continue; // default root absent on this repo — skip
+    }
+    if (st.isFile()) out.add(p);
+    else if (st.isDirectory()) {
+      for (const f of collectSourceFiles([p], false)) out.add(f);
+    }
+  }
+  return [...out].sort();
+}
+
+/**
  * Whole-file scan summary: per-rule counts, then per-file counts, then the
  * total (SPEC §13.4 report). `--json` emits
- * `{ "rules": {id: n}, "files": {path: n}, "total": n }`.
+ * `{ "rules": {id: n}, "files": {path: n}, "total": n }`. Directories are
+ * walked; unreadable files are skipped (deterministic, mirrors `scanUnits`).
  */
 export async function runReport(
   paths: readonly string[],
@@ -490,8 +638,13 @@ export async function runReport(
   const ruleCounts = new Map<string, number>();
   const fileCounts = new Map<string, number>();
   let total = 0;
-  for (const path of paths) {
-    const findings = lintFile(path, readSource(path), opts.config);
+  for (const path of expandReportPaths(paths)) {
+    let findings: Finding[];
+    try {
+      findings = lintFile(path, readSource(path), opts.config);
+    } catch {
+      continue; // unreadable files are skipped (deterministic)
+    }
     fileCounts.set(path, findings.length);
     for (const f of findings) {
       ruleCounts.set(f.rule, (ruleCounts.get(f.rule) ?? 0) + 1);
@@ -568,11 +721,62 @@ function requireValueFlag(parsed: ParsedArgs, name: string): void {
   if (parsed.bools.has(name)) throw new Error(`--${name} requires a value`);
 }
 
-async function cmdLint(args: readonly string[]): Promise<void> {
+/** `decompi lint --help` text. */
+const LINT_HELP = `decompi lint <paths…> [options]
+
+Whole-file scan with the source rules (smell.*, ptr.*, clone.*, plus the
+match.* rules when --fixture provides accepted work items). Directories are
+walked for source files (.cpp/.cc/.cxx/.c/.hpp/.hh/.hxx/.h); explicit files
+are linted regardless of extension.
+
+Default text output groups findings by rule:
+
+    smell.void_ptr: 2
+      src/a.cpp:4:3  void* p
+      src/a.cpp:8:5  void* q
+
+"clean: no findings in N file(s)" is printed (exit 0) when nothing is found.
+
+exit codes:
+  0  clean (no findings emitted) or --no-fail
+  1  at least one finding emitted (CI gate)
+
+options:
+  --delta          lint only the added lines against <path>.orig; without a
+                   <path>.orig the whole file is treated as added
+  --rule <id>      emit only findings of that rule id (e.g. smell.void_ptr,
+                   no_angle_include); unknown ids warn on stderr
+  --json           emit ONE JSON array of
+                   {rule,line,column,snippet,message,path} (one entry per
+                   finding, all files in a single document)
+  --markdown       emit a per-file report table (## path + a
+                   rule | line | column | snippet | message table)
+  --no-fail        force exit 0 even when findings are emitted
+  --config <path>  JSON LintConfig (placeholder patterns as regex strings)
+  --fixture <path> JSON fixture of accepted work items (match.* rules)
+  --help           show this help
+`;
+
+/** Rule ids the linter can ever emit (whole-file + delta + match.* families). */
+function knownRuleIds(cfg: LintConfig): Set<string> {
+  const ids = new Set(sourceRules.map((r) => r.id));
+  for (const r of deltaRules) ids.add(r.id);
+  if (cfg.match !== undefined) {
+    for (const r of matchRules(cfg.match)) ids.add(r.id);
+  }
+  return ids;
+}
+
+async function cmdLint(args: readonly string[]): Promise<number> {
+  if (args.includes("--help") || args.includes("-h")) {
+    process.stdout.write(LINT_HELP);
+    return 0;
+  }
   const parsed = parseArgs(args);
-  checkFlags(parsed, new Set(["delta", "json", "markdown", "config", "fixture"]));
+  checkFlags(parsed, new Set(["delta", "json", "markdown", "rule", "no-fail", "config", "fixture"]));
   requireValueFlag(parsed, "config");
   requireValueFlag(parsed, "fixture");
+  requireValueFlag(parsed, "rule");
   if (parsed.positionals.length === 0) {
     throw new Error("lint requires at least one path");
   }
@@ -584,16 +788,26 @@ async function cmdLint(args: readonly string[]): Promise<void> {
     // Merge config-supplied match patterns (regexes) with the fixture context.
     cfg.match = { ...cfg.match, ...context };
   }
+  const rule = parsed.values.get("rule");
+  if (rule !== undefined && !knownRuleIds(cfg).has(rule)) {
+    process.stderr.write(
+      `decompi: warning: --rule ${rule} matches no known rule — no findings will be emitted\n`,
+    );
+  }
   const fmt: "text" | "json" | "markdown" = parsed.bools.has("markdown")
     ? "markdown"
     : parsed.bools.has("json")
       ? "json"
       : "text";
-  await runLint(parsed.positionals, {
+  const findings = await runLint(parsed.positionals, {
     delta: parsed.bools.has("delta"),
     format: fmt,
+    rule,
     config: cfg,
   });
+  // CI gate: any emitted finding fails the run unless --no-fail.
+  if (findings > 0 && !parsed.bools.has("no-fail")) return 1;
+  return 0;
 }
 
 /** Game-code scan roots (cwd-relative), mirroring smell_report.py ROOTS. */
@@ -646,7 +860,43 @@ async function runCompleteness(adapter: SqlAdapter, out: Output): Promise<void> 
   out.write(`\nComplete TUs: ${complete}\n`);
 }
 
-async function cmdReport(args: readonly string[]): Promise<void> {
+/** `decompi report --help` text. */
+const REPORT_HELP = `decompi report [paths…] [options]
+
+Whole-file scan summary: per-rule counts, then per-file counts, then the
+total. With no paths, the game-code roots (src/kyoshin, libs/monolib/src,
+libs/nw4r/src) are scanned; explicit paths may be files or directories.
+
+options:
+  --json          emit a machine-readable {rules, files, total} object
+  --config <path> JSON LintConfig
+  --help          show this help
+
+CI gate (mirror of tools/coop/smell_report.py):
+  report --check [--base <ref>] [--no-strict] [--variant RVL] [--json]
+      Freshness: the committed docs/smells.md must equal a fresh
+      regeneration. Regression (strict, default): per-TU metrics must not
+      increase vs the baseline committed on the base branch (git show
+      <ref>:docs/smells.md; default origin/main → origin/master → HEAD~1).
+      New TUs are exempt; cleanup is always allowed. Exit 0 when the gate
+      passes, 1 when stale or regressed; --json emits the {ok, problems}
+      verdict.
+  report --write [--variant RVL]
+      Regenerate docs/smells.md from the current tree.
+  report --completeness [--db <path>] [--fixture <path>]
+      Live TU status table from the work-item registry (unit | targets |
+      accepted | status).
+
+exit codes:
+  0  gate passed / summary written
+  1  --check failed (stale doc or per-TU regression vs base)
+`;
+
+async function cmdReport(args: readonly string[]): Promise<number> {
+  if (args.includes("--help") || args.includes("-h")) {
+    process.stdout.write(REPORT_HELP);
+    return 0;
+  }
   const parsed = parseArgs(args);
   checkFlags(
     parsed,
@@ -666,14 +916,8 @@ async function cmdReport(args: readonly string[]): Promise<void> {
     } finally {
       adapter.close();
     }
-    return;
+    return 0;
   }
-
-  const configPath = parsed.values.get("config");
-  const config =
-    configPath !== undefined
-      ? loadConfigFile(configPath)
-      : undefined;
 
   const write = parsed.bools.has("write");
   const check = parsed.bools.has("check");
@@ -685,6 +929,7 @@ async function cmdReport(args: readonly string[]): Promise<void> {
     throw new Error(`unknown variant: ${variant} (expected RVL)`);
   }
   const isRvl = variant === "RVL";
+  const json = parsed.bools.has("json");
 
   if (check || write) {
     const paths =
@@ -693,24 +938,98 @@ async function cmdReport(args: readonly string[]): Promise<void> {
         : isRvl
           ? [RVL_ROOT]
           : DEFAULT_ROOTS;
-    const ok = runReportCheck(paths, {
-      check,
-      write,
-      base: parsed.values.get("base"),
-      strict: !parsed.bools.has("no-strict"),
-      variant: isRvl ? "rvl" : "game",
-      config,
-    });
-    if (!ok) {
-      throw new Error("report --check failed — see the problems above");
-    }
-    return;
+    const configPath = parsed.values.get("config");
+    const config =
+      configPath !== undefined
+        ? loadConfigFile(configPath)
+        : undefined;
+    const result = runReportGate(
+      paths,
+      {
+        check,
+        write,
+        base: parsed.values.get("base"),
+        strict: !parsed.bools.has("no-strict"),
+        variant: isRvl ? "rvl" : "game",
+        config,
+        json,
+      },
+      process.stdout,
+    );
+    return result.ok ? 0 : 1;
   }
 
-  if (parsed.positionals.length === 0) {
-    throw new Error("report requires at least one path (or --check / --write / --completeness)");
+  const configPath = parsed.values.get("config");
+  const config =
+    configPath !== undefined
+      ? loadConfigFile(configPath)
+      : undefined;
+  await runReport(parsed.positionals, { json, config });
+  return 0;
+}
+
+/** Outcome of the report gate: verdict + problems + which doc was touched. */
+interface ReportGateResult {
+  ok: boolean;
+  problems: string[];
+  reportPath: string;
+}
+
+/**
+ * The report gate (--write / --check): scan the roots, render, and compare.
+ * `--write` regenerates the committed doc; `--check` runs the freshness +
+ * regression gate (mirror of smell_report.py) and exits non-zero when the
+ * doc is stale or a per-TU metric regressed vs the base baseline. `--json`
+ * emits the machine-readable verdict instead of prose.
+ */
+export function runReportGate(
+  paths: readonly string[],
+  opts: {
+    check: boolean;
+    write: boolean;
+    base?: string;
+    strict: boolean;
+    variant: "game" | "rvl";
+    config?: LintConfig;
+    json?: boolean;
+  },
+  out: Output = process.stdout,
+): ReportGateResult {
+  const reportPath = opts.variant === "rvl" ? RVL_REPORT_DOC : REPORT_DOC;
+  const rows = scanUnits(paths, {
+    skipAsmBodies: opts.variant === "rvl",
+    includeC: opts.variant === "rvl",
+  });
+  const md = renderSmellReport(rows, { rvl: opts.variant === "rvl" });
+  if (opts.write) {
+    mkdirSync(dirname(reportPath), { recursive: true });
+    writeFileSync(reportPath, md);
+    if (opts.json === true) {
+      out.write(JSON.stringify({ ok: true, wrote: reportPath }, null, 2) + "\n");
+    } else {
+      out.write(`wrote ${reportPath}\n`);
+    }
+    return { ok: true, problems: [], reportPath };
   }
-  await runReport(parsed.positionals, { json: parsed.bools.has("json"), config });
+  const result = checkSmellReport(rows, {
+    reportPath,
+    base: opts.base,
+    strict: opts.strict,
+    rvl: opts.variant === "rvl",
+  });
+  if (opts.json === true) {
+    out.write(JSON.stringify({ ok: result.ok, problems: result.problems }, null, 2) + "\n");
+  } else {
+    for (const problem of result.problems) {
+      out.write(`ERROR: ${problem}\n`);
+    }
+    if (result.ok) {
+      out.write(`ok: ${reportPath} is fresh and no per-TU smell regression vs base.\n`);
+    } else {
+      out.write("\n--check failed.\n");
+    }
+  }
+  return { ok: result.ok, problems: result.problems, reportPath };
 }
 
 /**
@@ -731,33 +1050,11 @@ export function runReportCheck(
   },
   out: Output = process.stdout,
 ): boolean {
-  const reportPath = opts.variant === "rvl" ? RVL_REPORT_DOC : REPORT_DOC;
-  const rows = scanUnits(paths, {
-    skipAsmBodies: opts.variant === "rvl",
-    includeC: opts.variant === "rvl",
-  });
-  const md = renderSmellReport(rows, { rvl: opts.variant === "rvl" });
-  if (opts.write) {
-    mkdirSync(dirname(reportPath), { recursive: true });
-    writeFileSync(reportPath, md);
-    out.write(`wrote ${reportPath}\n`);
-    return true;
-  }
-  const result = checkSmellReport(rows, {
-    reportPath,
-    base: opts.base,
-    strict: opts.strict,
-    rvl: opts.variant === "rvl",
-  });
-  for (const problem of result.problems) {
-    out.write(`ERROR: ${problem}\n`);
-  }
-  if (result.ok) {
-    out.write(`ok: ${reportPath} is fresh and no per-TU smell regression vs base.\n`);
-  } else {
-    out.write("\n--check failed.\n");
-  }
-  return result.ok;
+  return runReportGate(
+    paths,
+    { ...opts, json: false },
+    out,
+  ).ok;
 }
 
 // ─── workflow status ladder (SPEC §A.2/A.5) + run (SPEC §6/§7) ────────────
@@ -984,6 +1281,10 @@ async function openAndImport(
   dbPath: string,
   fixturePath: string | undefined,
 ): Promise<SqliteAdapter> {
+  // Lazy: `node:sqlite` is experimental and prints an ExperimentalWarning on
+  // load, so only commands that actually touch the store pay for it (lint /
+  // report stay warning-free). The static import is type-only.
+  const { SqliteAdapter } = await import("../core/store/sqlite.js");
   const adapter = new SqliteAdapter(dbPath);
   try {
     await adapter.migrate([...MIGRATIONS]);
@@ -1160,6 +1461,9 @@ async function cmdServe(args: readonly string[]): Promise<void> {
   // --detached is a no-op hint for M4: the daemon runs in the foreground
   // today. CI's detached `decompi serve` (SPEC §5: "CI starts a detached one")
   // lands with the worker-protocol milestone; nothing changes behaviour yet.
+  // startServer is loaded lazily: it pulls in `node:sqlite`, whose load prints
+  // an ExperimentalWarning to stderr — kept off the lint/report hot paths.
+  const { startServer } = await import("../server/serve.js");
   const { close } = await startServer({
     ...(port !== undefined ? { port } : {}),
     dbPath: parsed.values.get("db") ?? "decompi.db",
@@ -1203,39 +1507,54 @@ async function cmdModels(args: readonly string[]): Promise<void> {
   }
 }
 
-export async function main(argv: readonly string[]): Promise<void> {
+/**
+ * Run the CLI. Returns the process exit code (the bin entry maps it onto
+ * `process.exitCode`): 0 normally, 1 when `lint` emitted findings (unless
+ * `--no-fail`) or when the `report --check` gate failed. Errors throw and
+ * are caught by the bin entry, which also exits 1.
+ */
+export async function main(argv: readonly string[]): Promise<number> {
   const command = argv[0];
   if (command === undefined) {
     process.stdout.write(USAGE);
-    return;
+    return 0;
   }
   if (command === "-h" || command === "--help") {
     process.stdout.write(USAGE);
-    return;
+    return 0;
   }
   switch (command) {
     case "status":
-      return cmdStatus(argv.slice(1));
+      await cmdStatus(argv.slice(1));
+      return 0;
     case "select":
-      return cmdSelect(argv.slice(1));
+      await cmdSelect(argv.slice(1));
+      return 0;
     case "lint":
       return cmdLint(argv.slice(1));
     case "report":
       return cmdReport(argv.slice(1));
     case "export":
-      return cmdExport(argv.slice(1));
+      await cmdExport(argv.slice(1));
+      return 0;
     case "import":
-      return cmdImport(argv.slice(1));
+      await cmdImport(argv.slice(1));
+      return 0;
     case "analyze":
-      return cmdAnalyze(argv.slice(1));
+      await cmdAnalyze(argv.slice(1));
+      return 0;
     case "workflow":
-      return cmdWorkflow(argv.slice(1));
+      await cmdWorkflow(argv.slice(1));
+      return 0;
     case "run":
-      return cmdRun(argv.slice(1));
+      await cmdRun(argv.slice(1));
+      return 0;
     case "models":
-      return cmdModels(argv.slice(1));
+      await cmdModels(argv.slice(1));
+      return 0;
     case "serve":
-      return cmdServe(argv.slice(1));
+      await cmdServe(argv.slice(1));
+      return 0;
     default:
       throw new Error(`unknown command: ${command}`);
   }
@@ -1243,10 +1562,14 @@ export async function main(argv: readonly string[]): Promise<void> {
 
 const entry = process.argv[1];
 if (entry !== undefined && import.meta.url === pathToFileURL(entry).href) {
-  main(process.argv.slice(2)).catch((err: unknown) => {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`decompi: ${message}`);
-    console.error("Run 'decompi --help' for usage.");
-    process.exitCode = 1;
-  });
+  main(process.argv.slice(2))
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`decompi: ${message}`);
+      console.error("Run 'decompi --help' for usage.");
+      process.exitCode = 1;
+    });
 }

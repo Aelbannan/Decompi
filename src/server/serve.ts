@@ -2,7 +2,8 @@
  * M4 serve wiring (SPEC §15, §16, §19 M4 row): `startServer` brings up the
  * whole control plane in one call — the embedded store daemon (single
  * writer), a pipeline engine with the builtin `match` pipelines, a
- * MockAgentRuntime-backed run scheduler, the bearer-auth REST/WS API, and
+ * MockAgentRuntime-backed run scheduler (or the optional real pi SDK agent
+ * runtime when one is wired in), the bearer-auth REST/WS API, and
  * the web/ dashboard (index.html + app.js) at `/` — all on 127.0.0.1
  * (SPEC §16 default bind; the API server in api.ts is not modified).
  *
@@ -34,6 +35,7 @@ import type {
 import { StoreDaemon } from "../core/daemon.js";
 import { SqliteAdapter } from "../core/store/sqlite.js";
 import { MockAgentRuntime } from "../agent/mock.js";
+import type { AgentRuntime } from "../agent/runtime.js";
 import { PipelineEngine } from "../pipeline/engine.js";
 import { registerMatchPipelines } from "../pipeline/builtin/match.js";
 import { RunScheduler } from "./scheduler.js";
@@ -86,6 +88,13 @@ export interface StartServerOptions {
    * once cumulative audited spend exceeds it. Defaults to unlimited.
    */
   globalSpendCapMicroUsd?: number;
+  /**
+   * Agent runtime backing run sessions. When provided (e.g. a
+   * {@link PiAgentRuntime} wired to the real pi SDK), the scheduler uses it
+   * instead of the deterministic {@link MockAgentRuntime} default (kept as
+   * the default for tests and dry runs).
+   */
+  agentRuntime?: AgentRuntime;
 }
 
 /** A running control plane: the HTTP server plus an idempotent shutdown. */
@@ -221,7 +230,8 @@ function listen(server: HttpServer, port: number): Promise<number> {
  * Bring up the M4 control plane (SPEC §15 `decompi serve`, §16 security):
  * migrate the store, start the embedded store daemon (single writer +
  * continuous lease reaping), register the builtin match pipelines on a
- * fresh engine, wire a MockAgentRuntime-backed run scheduler, provision the
+ * fresh engine, wire a MockAgentRuntime-backed run scheduler (or the
+ * optional pi SDK agent runtime), provision the
  * requested auth tokens, create the bearer-auth API server, layer web/ at
  * `/`, and bind 127.0.0.1:<port>. Prints
  * `decompi: serving on http://127.0.0.1:<port>` once listening.
@@ -263,13 +273,14 @@ export async function startServer(opts: StartServerOptions = {}): Promise<StartS
     const helpers = new HelperRegistry();
     registerHelpers(helpers);
 
-    // Run scheduler on the deterministic mock runtime (the real pi SDK
-    // agent adapter lands in M5).
+    // Run scheduler: the real pi SDK agent runtime when one is wired in
+    // (PiAgentRuntime), otherwise the deterministic mock runtime (tests /
+    // dry runs — the scheduler contract is identical either way).
     scheduler = new RunScheduler({
       store: adapter,
       engine,
       maxParallelRuns: opts.maxParallelRuns ?? DEFAULT_MAX_PARALLEL_RUNS,
-      runtime: new MockAgentRuntime(),
+      runtime: opts.agentRuntime ?? new MockAgentRuntime(),
       daemon,
       statusesStore,
       helpers,

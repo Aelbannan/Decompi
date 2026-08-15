@@ -21,7 +21,8 @@
   "dependencies": {
     "tree-sitter": "0.22.1",
     "tree-sitter-cpp": "^0.23.4",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "@earendil-works/pi-coding-agent": "file:/Users/ahmedelbannan/.local/lib/node_modules/@earendil-works/pi-coding-agent"
   },
   "//": "tree-sitter is pinned EXACT (not ^ / ~): 0.22.2+ tightened the Language type to a self-referential Language, which breaks `tsc` against tree-sitter-cpp@0.23.4's `language: unknown` export (verified: ~0.22.1 resolves to 0.22.4 → typecheck fails in src/parse/cpp/tree.ts). A range also cannot install at all: a clean `npm install` hits ERESOLVE because tree-sitter-cpp@0.23.4 declares peerOptional tree-sitter@^0.21.1 — use --legacy-peer-deps. Runtime grammar behaviour is identical (tree-sitter-cpp 0.23.4); 0.22.1 lifts the 32 KiB parse-size limit of 0.21.1 (see docs/m1a-parity.md).",
   "devDependencies": {
